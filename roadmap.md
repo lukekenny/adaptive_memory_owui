@@ -164,7 +164,6 @@ The roadmap is organized into four key areas:
 - ⚠️ Awaiting verification after fixing memory injection issues to confirm end-to-end functionality
 
 **Note:** While the implementation is complete, verification requires resolving the embedding dimension mismatch issue currently preventing memory injection.
-
 ### 3. Personalized Response Tailoring (Prompt Injection) (Feature 7)
 
 **Goal:** Leverage stored preferences to instruct LLM to tailor response style/content.
