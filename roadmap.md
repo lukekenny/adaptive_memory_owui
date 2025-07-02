@@ -5,10 +5,10 @@
 This document outlines the planned improvements and features for the `adaptive_memory` plugin. For completed items, see `completed_improvements.md`. All implementations **must** strictly adhere to the guidelines defined in `rules.md`.
 
 The roadmap is organized into four key areas:
-1. **Core Improvements (Items 1, 8-11)**: Enhancing stability, performance, and maintainability
-2. **User Experience (Items 2-7, 12-13)**: Adding user-facing features and controls
-3. **Integration & Portability (Item 14)**: Enabling cross-platform memory access
-4. **Privacy & Monitoring (Items 15-16)**: Improving transparency and data protection
+1. **Core Improvements (Items 1, 5-8)**: Enhancing stability, performance, and maintainability
+2. **User Experience (Items 2-4, 9)**: Adding user-facing features and controls
+3. **Integration & Portability (Item 10)**: Enabling cross-platform memory access
+4. **Privacy & Monitoring (Items 11-12)**: Improving transparency and data protection
 
 ## Implementation Guidelines
 
@@ -120,107 +120,12 @@ The roadmap is organized into four key areas:
 - No performance regression
 - Comprehensive documentation
 
-### 2. Memory Editing Functionality (Feature 1)
-
-**Goal:** Allow users to directly interact with memories via chat commands.
-**Complexity:** Medium-High
-**Confidence:** High
-**Status:** ⏳ Pending
-
-**Technical Details:**
-*   **Command Syntax:**
-    ```
-    /memory list [page] [filter]
-    /memory forget <id>
-    /memory edit <id> <new_content>
-    /memory search <query>
-    ```
-
-*   **Command Parameters:**
-    ```python
-    list:
-      page: int = 1
-      filter: Optional[str] = None  # e.g., "tag:preference", "bank:personal"
-      
-    forget:
-      id: str  # UUID of memory to delete
-      
-    edit:
-      id: str  # UUID of memory to modify
-      new_content: str  # Updated memory text
-      
-    search:
-      query: str  # Text/semantic search query
-    ```
-
-*   **Response Formats:**
-    ```python
-    list_response = {
-      "memories": List[Dict[str, Any]],
-      "total": int,
-      "page": int,
-      "pages": int,
-      "filter": Optional[str]
-    }
-    
-    edit_response = {
-      "success": bool,
-      "old_content": str,
-      "new_content": str,
-      "memory_id": str
-    }
-    ```
-
-*   **Security Considerations:**
-    - Validate memory ownership
-    - Rate limit commands
-    - Sanitize input
-    - Audit logging
-
-**Subtasks:**
-*   **Define Command Syntax:**
-    - Design command grammar
-    - Define parameter validation
-    - Create help documentation
-    - Plan error messages
-
-*   **Implement Command Detection/Parsing:**
-    - Add regex patterns
-    - Create command parser
-    - Add parameter validation
-    - Implement help system
-
-*   **Implement Command Logic:**
-    - Create command handlers
-    - Integrate with OWUI APIs
-    - Add error handling
-    - Implement pagination
-
-*   **UI Integration:**
-    - Add status messages
-    - Create success/error displays
-    - Implement progress indicators
-    - Add command suggestions
-
-*   **Documentation Updates:**
-    - Command reference guide
-    - Example usage
-    - Error troubleshooting
-    - Performance notes
-
-**Expected Successful Output:**
-- Full CRUD operations via chat
-- Intuitive command syntax
-- Clear feedback messages
-- Comprehensive documentation
-- Robust error handling
-
-### 3. Dynamic Memory Tagging (Feature 2)
+### 2. Dynamic Memory Tagging (Feature 2)
 
 **Goal:** Allow LLM to generate relevant keyword tags for memories during extraction.
 **Complexity:** Medium
 **Confidence:** Medium
-**Status:** ⏳ Pending
+**Status:** ✅ Implemented - Awaiting Verification
 
 **Technical Details:**
 *   **Tag Generation Prompt:**
@@ -239,58 +144,28 @@ The roadmap is organized into four key areas:
 
 *   **Tag Storage Format:**
     ```python
-    class MemoryTags(BaseModel):
-        static_tags: List[str]  # Category tags (identity, preference, etc.)
-        dynamic_tags: List[str]  # LLM-generated content tags
-        confidence: Dict[str, float]  # Tag confidence scores
+    # Implemented as part of MemoryOperation model:
+    dynamic_tags: Optional[List[Dict[str, Any]]] = None  # [{"tag": str, "confidence": float}, ...]
     ```
 
 *   **Tag Validation Rules:**
-    - Max length: 30 chars
-    - Allowed chars: a-z, 0-9, _
-    - Min confidence: 0.6
-    - No duplicates
-    - Max tags: 5 total
+    - Implemented in `_validate_dynamic_tags`
+    - Min confidence: 0.65 (configurable via `dynamic_tag_min_confidence_threshold` valve)
+    - Allowed chars: a-z, 0-9, _ (enforced via regex validation)
+    - Max tags: 5 total (configurable)
 
-### 4. On-Demand Memory Summarization by Tag/Topic (Feature 5)
+**Implementation Status:**
+- ✅ Added `dynamic_tags` field to `MemoryOperation` Pydantic model
+- ✅ Created new valves for controlling dynamic tagging (enabled/disabled, min confidence, etc.)
+- ✅ Implemented `_generate_and_validate_dynamic_tags` function for LLM-based tag generation
+- ✅ Modified `_execute_memory_operation` to include tag generation for new memories
+- ✅ Updated memory formatting functions to display dynamic tags in memory content
+- ✅ Enhanced memory retrieval to include dynamic tag information
+- ⚠️ Awaiting verification after fixing memory injection issues to confirm end-to-end functionality
 
-**Goal:** Allow users to request summary of memories related to a specific topic/tag via chat command.
-**Complexity:** Medium-High
-**Confidence:** High
-**Status:** ⏳ Pending
+**Note:** While the implementation is complete, verification requires resolving the embedding dimension mismatch issue currently preventing memory injection.
 
-**Subtasks:**
-*   **Define Command Syntax:** e.g., `/memory summarize [topic/tag]`.
-*   **Implement Command Detection/Parsing:** Add logic in `inlet`.
-*   **Implement Command Logic:** If detected, parse topic, retrieve all memories, filter by topic/tag, construct LLM prompt (`memory_merge_prompt`?) with filtered memories, call LLM for summary, format response, return body bypassing LLM.
-*   **UI Integration:** Add status messages showing progress during retrieval and summarization; provide clear feedback on success/failure.
-*   **Performance Optimization:** Implement caching for summaries to avoid repeated LLM calls for the same topic/tag.
-*   **Documentation Updates:** Add command usage and examples to the plugin docstring.
-*   *(Adhere to `rules.md`)*
-*   **Test:** Use command with different topics/tags; verify correct memories are summarized and response is accurate; test with large memory sets to ensure performance.
-
-**Expected Successful Output:** Users can request summaries of specific memory areas via chat with clear feedback. Implementation follows `rules.md`.
-
-### 5. Temporary "Scratchpad" Memory (Feature 6)
-
-**Goal:** Provide a mechanism for users to store temporary notes via chat command for current session context.
-**Complexity:** Medium
-**Confidence:** High
-**Status:** ⏳ Pending
-
-**Subtasks:**
-*   **Define Command Syntax:** e.g., `/note [content]`.
-*   **Implement Command Detection:** Add logic in `inlet`.
-*   **Implement Command Logic:** If detected, extract content, format with `scratchpad` tag and timestamp, call `add_memory`, return confirmation (bypass LLM).
-*   **Modify Retrieval:** Modify `get_relevant_memories` to prioritize `scratchpad` tags and implement TTL logic (ignore old scratchpad items).
-*   **UI Integration:** Add visual indicator for scratchpad memories in context display; provide clear confirmation when notes are saved.
-*   **Documentation Updates:** Document the scratchpad feature and command usage in the docstring.
-*   *(Adhere to `rules.md`)*
-*   **Test:** Use `/note` command, verify storage and confirmation; verify scratchpad items are prioritized in retrieval within TTL; test TTL expiration behavior.
-
-**Expected Successful Output:** Users can store/recall temporary notes via `/note` command within a time window with clear UI feedback. Implementation follows `rules.md`.
-
-### 6. Personalized Response Tailoring (Prompt Injection) (Feature 7)
+### 3. Personalized Response Tailoring (Prompt Injection) (Feature 7)
 
 **Goal:** Leverage stored preferences to instruct LLM to tailor response style/content.
 **Complexity:** Medium
@@ -307,27 +182,7 @@ The roadmap is organized into four key areas:
 
 **Expected Successful Output:** LLM responses more aligned with user preferences without performance impact. Implementation follows `rules.md`.
 
-### 7. Memory Importance Weighting (Feature 8)
-
-**Goal:** Allow users to mark memories as important, influencing retrieval and pruning.
-**Complexity:** Medium
-**Confidence:** High
-**Status:** ⏳ Pending
-
-**Subtasks:**
-*   **Define Command Syntax:** e.g., `/memory mark_important [id]`, `/memory unmark_important [id]`.
-*   **Implement Command Handling:** Add logic in `inlet` to detect these commands and parse the `memory_id`.
-*   **Store Importance:** Determine storage method. E.g., add an `importance: high` field to memory metadata, or use a specific tag like `[importance: high]` within the content.
-*   **Modify Retrieval:** Update `get_relevant_memories` logic. If importance is stored in metadata, boost relevance score for important memories. If stored as a tag, ensure it's parsed and used.
-*   **Modify Pruning:** Update `_process_user_memories`. When pruning (`least_relevant` strategy), ensure important memories are preserved (e.g., assign them a very high base relevance or exclude them from pruning candidates).
-*   **UI Integration:** Add visual indicator (e.g., ⭐) for important memories in `/memory list` output and context display.
-*   **Documentation Updates:** Document the commands and their effect on retrieval/pruning in the docstring.
-*   *(Adhere to `rules.md`)*
-*   **Test:** Mark/unmark memories; verify retrieval prioritization; verify pruning preservation; check UI indicators.
-
-**Expected Successful Output:** Users can influence memory lifecycle via importance commands with clear feedback. Implementation follows `rules.md`.
-
-### 8. Verify Cross-Session Memory Persistence (Bug Fix/Verification)
+### 4. Verify Cross-Session Memory Persistence (Bug Fix/Verification)
 
 **Goal:** Ensure memories saved for a user persist and are retrievable across different chat sessions initiated by the same user.
 **Complexity:** Medium
@@ -344,7 +199,7 @@ The roadmap is organized into four key areas:
 
 **Expected Successful Output:** Clear confirmation whether cross-session memory works as intended; bugs in ID handling fixed; plugin handles missing user data gracefully; or limitations documented.
 
-### 9. Improve Configuration Handling & Validation (Bug Fix/Refinement)
+### 5. Improve Configuration Handling & Validation (Bug Fix/Refinement)
 
 **Goal:** Ensure all configuration 'Valves' (especially thresholds) are loaded correctly, applied consistently, and have sensible defaults.
 **Complexity:** Medium
@@ -360,7 +215,7 @@ The roadmap is organized into four key areas:
 
 **Expected Successful Output:** Increased confidence that valves are working as configured; clearer debugging information; potentially better out-of-the-box relevance via improved defaults.
 
-### 10. Enhance Memory Retrieval Tuning (Refinement)
+### 6. Enhance Memory Retrieval Tuning (Refinement)
 
 **Goal:** Improve the semantic relevance of retrieved memories beyond exact matches, making the system feel less strict.
 **Complexity:** Medium
@@ -377,7 +232,7 @@ The roadmap is organized into four key areas:
 
 **Expected Successful Output:** Memory retrieval feels more intuitive and less reliant on exact keyword matches; relevant concepts are surfaced more reliably.
 
-### 11. Improve Processing Status & Error Feedback (UX/Robustness)
+### 7. Improve Processing Status & Error Feedback (UX/Robustness)
 
 **Goal:** Provide clearer, more specific feedback to the user about memory operations, especially failures, and prevent indefinite hangs.
 **Complexity:** Medium
@@ -394,7 +249,7 @@ The roadmap is organized into four key areas:
 
 **Expected Successful Output:** Users receive clearer feedback on memory operations; plugin is more resilient to hangs and parsing errors; debugging is easier.
 
-### 12. Expand Documentation & Usage Clarity (Docs)
+### 8. Expand Documentation & Usage Clarity (Docs)
 
 **Goal:** Make it easier for users to understand and utilize the plugin's features and configurations.
 **Complexity:** Low
@@ -403,30 +258,13 @@ The roadmap is organized into four key areas:
 
 **Subtasks:**
 *   **Expand Docstring User Guide:** Add sections explaining core concepts (extraction, relevance, banks), detail *all* important Valves, clarify bank usage/selection, add troubleshooting tips for common issues (relevance, JSON errors).
-*   **Add `/memory help` Command:** Implement a simple command in `inlet` that lists available `/memory` commands and their syntax.
-*   **Maintain Roadmap Docs:** Keep `improvement_plan.md` and `completed_improvements.md` updated.
+*   **Maintain Roadmap Docs:** Keep `roadmap.md` and `completed_improvements.md` updated.
 *   *(Adhere to `rules.md`)*
-*   **Test:** Review the updated User Guide for clarity and completeness; test the `/memory help` command.
+*   **Test:** Review the updated User Guide for clarity and completeness.
 
 **Expected Successful Output:** Users can more easily understand plugin features, configure valves, and use commands through improved in-plugin documentation.
 
-### 13. Enhance User Control over Memory (Feature/Bug Fix)
-
-**Goal:** Ensure users can disable memory via standard settings and provide more granular control during chat.
-**Complexity:** Medium
-**Confidence:** High
-**Status:** ⏳ Pending
-
-**Subtasks:**
-*   **Verify User Setting:** Add logging at start of `inlet`/`outlet` to confirm `user_valves.enabled` is correctly read from `__user__` and respected. Fix if necessary.
-*   **Implement Session Toggle Commands:** Add `/memory pause` and `/memory resume` commands in `inlet` to temporarily disable/enable memory processing for the current session (requires managing session state, perhaps a simple dict).
-*   **Implement Bank Selection Commands:** Add `/memory use_banks [bank1],[bank2]` and `/memory use_all_banks` commands. Modify `get_relevant_memories` to filter based on active banks stored in session state.
-*   *(Adhere to `rules.md`)*
-*   **Test:** Verify user enable/disable setting works; test pause/resume commands; test bank selection commands and verify retrieval filtering.
-
-**Expected Successful Output:** Plugin respects global user settings; users gain session-level control over memory activity and bank focus via commands.
-
-### 14. Always-Sync to RememberAPI (Feature Add-on)
+### 9. Always-Sync to RememberAPI (Feature Add-on)
 
 **Goal:** Automatically synchronize newly saved local memories to an external RememberAPI account in real-time, allowing memory portability across different services (ChatGPT, Claude, etc.) without manual export/import.
 **Complexity:** Medium
@@ -560,7 +398,7 @@ The roadmap is organized into four key areas:
 - Detailed documentation
 - Robust security
 
-### 15. Enhance Status Emitter Transparency (UX/Debugging)
+### 10. Enhance Status Emitter Transparency (UX/Debugging)
 
 **Goal:** Improve the clarity, accuracy, and coverage of status messages emitted to the UI.
 **Complexity:** Low-Medium
@@ -596,7 +434,7 @@ The roadmap is organized into four key areas:
     }
     ```
 
-### 16. Optional PII Stripping on Save (Privacy Enhancement)
+### 11. Optional PII Stripping on Save (Privacy Enhancement)
 
 **Goal:** Add an option to automatically detect and redact/anonymize common PII patterns before saving memories locally.
 **Complexity:** Medium
@@ -618,19 +456,19 @@ The roadmap is organized into four key areas:
 ## Timeline & Priorities
 
 ### Phase 1: Core Stability (1-2 months)
-- Items 1, 8, 9: Refactoring, persistence verification, config handling
+- Items 1, 4, 5: Refactoring, persistence verification, config handling
 - Success Metrics: Code coverage > 90%, No critical bugs, Clear documentation
 
 ### Phase 2: User Experience (2-3 months)
-- Items 2-7: Memory editing, tagging, summarization, etc.
-- Success Metrics: User satisfaction surveys, Command usage metrics
+- Items 2-3, 6-8: Memory tagging, personalization, retrieval tuning, etc.
+- Success Metrics: User satisfaction surveys, Improved memory retrieval metrics
 
 ### Phase 3: Integration (1-2 months)
-- Item 14: RememberAPI sync
+- Item 9: RememberAPI sync
 - Success Metrics: Sync success rate > 99%, < 100ms latency
 
 ### Phase 4: Privacy & Monitoring (1-2 months)
-- Items 15-16: Status emitter, PII handling
+- Items 10-11: Status emitter, PII handling
 - Success Metrics: All operations tracked, No PII leaks
 
 ## Contributing

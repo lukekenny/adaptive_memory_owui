@@ -27,18 +27,18 @@ The system **dynamically extracts, filters, stores, and retrieves** user-specifi
 
 # Recent Improvements (v3.0)
 
-*   Optimized relevance calculation (Vector-only option, LLM skip threshold).
-*   Enhanced memory deduplication (Embedding-based option).
-*   Added intelligent memory pruning strategies (FIFO / Least Relevant).
-*   Implemented cluster-based memory summarization.
-*   Optimized LLM calls (e.g., skipping relevance check when vector scores are high).
-*   Improved resilience of LLM JSON response parsing.
-*   Added configuration valves for background tasks (summarization, logging, etc.).
-*   Added input validation for configuration valves.
-*   Refined memory filtering logic and defaults.
-*   Generalized LLM provider configuration (Ollama/OpenAI-compatible).
-*   Introduced Memory Banks for categorization.
-*   Fixed configuration persistence issues.
+1.  Optimized Relevance Calculation (Vector-only option, LLM skip threshold)
+2.  Enhanced Deduplication (Embedding-based option)
+3.  Intelligent Memory Pruning (FIFO / Least Relevant options)
+4.  Cluster-Based Summarization
+5.  LLM Call Optimization (High-confidence vector skip)
+6.  Resilient JSON Parsing (Fallbacks, structured output requests)
+7.  Background Task Management Valves
+8.  Input Validation for Valves
+9.  Refined Filtering Logic (Defaults, shortcuts)
+10. Generalized LLM Provider Support (Feature #12)
+11. Memory Banks (Feature #11)
+12. Fixed Config Persistence (Issue #19)
 
 # Recent Improvements (v3.1)
 
@@ -110,14 +110,6 @@ Adjust these settings via `Admin Panel` → `Plugins` → `Adaptive Memory`:
 *   **Memory Banks**
     *   `allowed_memory_banks` (list): Which banks are valid (e.g., ["General", "Personal", "Work"]). Edit this list to add/remove banks.
     *   `default_memory_bank` (str): Bank used if LLM doesn't specify a valid one from the allowed list. (Default: "General")
-    *   Use `/memory list_banks` to see allowed banks and `/memory assign_bank [id] [bank]` to recategorize.
-
-## Commands
-Use these in the chat input:
-- `/memory list_banks`: Show available memory banks and the default.
-- `/memory assign_bank [memory_id] [bank_name]`: Assign an existing memory to a different bank (use ID from `show_memories` output if enabled).
-
-> **Note:** More commands are planned for future updates. See the Roadmap section.
 
 ## Troubleshooting
 *   **Memories not saving?**
@@ -130,10 +122,10 @@ Use these in the chat input:
     *   If retrieval happens but nothing is injected (`✅ Injecting 0 memories...`), it likely means no saved memories met the relevance criteria for the current message. Try lowering `vector_similarity_threshold` and `relevance_threshold` (e.g., to 0.5 or 0.45) and test again. Remember relevance depends on the *current message* context.
     *   Ensure you are in a new chat session *with the same user* where memories were previously saved. Memory is user-specific, not global.
 
-*   **Status stuck on "Extracting..."?**
+*   **Status stuck on "Extracting..."?** 
     This might indicate an issue with the LLM configured for extraction (`llm_model_name`, `llm_api_endpoint_url`) or a timeout. Check OpenWebUI server logs.
 
-*   **Seeing relevance/similarity threshold warnings in logs?**
+*   **Seeing relevance/similarity threshold warnings in logs?** 
     This usually means the `vector_similarity_threshold` and `relevance_threshold` values might be slightly different, which is fine if `use_llm_for_relevance` is `true`, but can cause confusion if it's `false`. Ensure they match if you're using vector-only relevance.
 
 *   **Local embedding model errors ('Failed to load', 'Dimension mismatch')?**
@@ -143,26 +135,28 @@ Use these in the chat input:
 ---
 
 # Roadmap
-The following improvements and features are planned (see `improvement_plan.md` for details):
+The following improvements and features are planned (see `roadmap.md` for details):
 
 1.  Refactor Large Methods: Improve code readability.
-2.  Memory Editing Functionality: Add `/memory list`, `forget`, `edit` commands.
-3.  Dynamic Memory Tagging: Allow LLM to generate keyword tags.
-4.  On-Demand Summarization: Add `/memory summarize [topic]` command.
-5.  Temporary Scratchpad: Add `/note [content]` command for session notes.
-6.  Personalized Response Tailoring: Use preferences to guide LLM style.
-7.  Memory Importance Weighting: Add `/memory mark_important` command.
-8.  Verify Cross-Session Persistence: Confirm memory availability across sessions.
-9.  Improve Config Handling: Better defaults, debugging for Valves.
-10. Enhance Retrieval Tuning: Improve semantic relevance beyond keywords.
-11. Improve Status/Error Feedback: More specific UI messages & logging.
-12. Expand Documentation: Add `/memory help` command, more details in User Guide.
-13. Enhance User Control: Session pause/resume, bank selection commands (`/memory pause`, `/memory resume`, `/memory use_banks`).
-14. Always-Sync to RememberAPI: Automatically sync new memories to RememberAPI for cross-tool portability.
-15. Enhance Status Emitter Transparency: Improve clarity and coverage of UI status messages.
-16. Optional PII Stripping: Add valve to redact common PII patterns on save.
-
-(See `completed_improvements.md` for already implemented items.)
+2.  Dynamic Memory Tagging: Allow LLM to generate keyword tags.
+3.  Personalized Response Tailoring: Use preferences to guide LLM style.
+4.  Verify Cross-Session Persistence: Confirm memory availability across sessions.
+5.  Improve Config Handling: Better defaults, debugging for Valves.
+6.  Enhance Retrieval Tuning: Improve semantic relevance beyond keywords.
+7.  Improve Status/Error Feedback: More specific UI messages & logging.
+8.  Expand Documentation: More details in User Guide.
+9.  Always-Sync to RememberAPI (Optional): Provide an **optional** mechanism to automatically sync memories to an external RememberAPI service **in addition to** storing them locally in OpenWebUI. This allows memory portability across different tools that support RememberAPI (e.g., custom GPTs, Claude bots) while maintaining the local memory bank. **Privacy Note:** Enabling this means copies of your memories are sent externally to RememberAPI. Use with caution and ensure compliance with RememberAPI's terms and privacy policy.
+10. Enhance Status Emitter Transparency: Improve clarity and coverage.
+11. Optional PII Stripping on Save: Automatically detect and redact common PII patterns before saving memories.
 
 ---
-"""
+
+## Contributing
+
+We welcome contributions! Please see `CONTRIBUTING.md` (if available) or standard open-source contribution guidelines.
+
+---
+
+# License
+
+This project is licensed under the MIT License.
