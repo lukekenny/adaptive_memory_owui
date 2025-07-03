@@ -1599,6 +1599,28 @@ Analyze the following related memories and provide a concise summary.""",
             default=3,
             description="Size of text shingles for fingerprinting (3-grams are typical)"
         )
+        
+        # LSH (Locality Sensitive Hashing) settings
+        use_lsh_optimization: bool = Field(
+            default=True,
+            description="Use LSH to optimize duplicate detection performance (reduces comparisons)"
+        )
+        
+        lsh_threshold_for_activation: int = Field(
+            default=100,
+            description="Minimum number of existing memories before LSH optimization is activated"
+        )
+        
+        # Enhanced Confidence Scoring settings
+        use_enhanced_confidence_scoring: bool = Field(
+            default=True,
+            description="Use enhanced multi-factor confidence scoring for duplicate detection"
+        )
+        
+        confidence_scoring_combined_threshold: float = Field(
+            default=0.7,
+            description="Threshold for combined confidence score to consider as duplicate"
+        )
 
         # Time settings
         timezone: str = Field(
@@ -1781,6 +1803,9 @@ Your output must be valid JSON only. No additional text.""",
             'cache_ttl_seconds', 'max_retries', 'max_injected_memory_length',
             'summarization_min_cluster_size', 'summarization_max_cluster_size', # Added
             'summarization_min_memory_age_days', # Added
+            'max_concurrent_connections', 'connection_pool_size', 'health_check_interval',
+            'circuit_breaker_failure_threshold', 'circuit_breaker_timeout',
+            'connection_keepalive_timeout', 'dns_cache_ttl', 'max_connection_retries',
         )
         def check_non_negative_int(cls, v, info):
             if not isinstance(v, int) or v < 0:
@@ -1809,7 +1834,7 @@ Your output must be valid JSON only. No additional text.""",
                 )
             return v
 
-        @field_validator('retry_delay')
+        @field_validator('retry_delay', 'request_timeout', 'connection_timeout', 'connection_retry_delay')
         def check_non_negative_float(cls, v, info):
             if not isinstance(v, float) or v < 0.0:
                 raise ValueError(f"{info.field_name} must be a non-negative float")
@@ -2038,6 +2063,65 @@ Your output must be valid JSON only. No additional text.""",
             description="Level of isolation from other filters: none=no isolation, partial=state isolation, full=complete isolation"
         )
         # ------ End Filter Orchestration Configuration ------
+
+        # ------ Begin LLM Connection & Circuit Breaker Configuration ------
+        request_timeout: float = Field(
+            default=120.0,
+            description="Request timeout in seconds for LLM API calls"
+        )
+        connection_timeout: float = Field(
+            default=30.0,
+            description="Connection timeout in seconds for LLM API connections"
+        )
+        max_concurrent_connections: int = Field(
+            default=10,
+            description="Maximum number of concurrent connections to LLM API"
+        )
+        connection_pool_size: int = Field(
+            default=20,
+            description="Size of the connection pool for HTTP connections"
+        )
+        enable_health_checks: bool = Field(
+            default=True,
+            description="Enable periodic health checks for LLM endpoints"
+        )
+        health_check_interval: int = Field(
+            default=300,
+            description="Interval in seconds between health checks"
+        )
+        circuit_breaker_failure_threshold: int = Field(
+            default=5,
+            description="Number of consecutive failures before opening circuit breaker"
+        )
+        circuit_breaker_timeout: int = Field(
+            default=60,
+            description="Time in seconds before attempting to close circuit breaker"
+        )
+        enable_connection_pooling: bool = Field(
+            default=True,
+            description="Enable HTTP connection pooling for improved performance"
+        )
+        connection_keepalive_timeout: int = Field(
+            default=30,
+            description="Keep-alive timeout for HTTP connections in seconds"
+        )
+        dns_cache_ttl: int = Field(
+            default=300,
+            description="DNS cache TTL in seconds for connection optimization"
+        )
+        enable_connection_diagnostics: bool = Field(
+            default=True,
+            description="Enable detailed connection diagnostics and logging"
+        )
+        max_connection_retries: int = Field(
+            default=3,
+            description="Maximum number of connection retry attempts"
+        )
+        connection_retry_delay: float = Field(
+            default=2.0,
+            description="Base delay in seconds between connection retry attempts"
+        )
+        # ------ End LLM Connection & Circuit Breaker Configuration ------
 
         @field_validator(
             'allowed_memory_banks', # Add validation for this field
@@ -3673,11 +3757,11 @@ Your output must be valid JSON only. No additional text.""",
                 self._session_connector = TCPConnector(
                     limit=self.valves.connection_pool_size,
                     limit_per_host=self.valves.max_concurrent_connections,
-                    ttl_dns_cache=300,  # DNS cache TTL
+                    ttl_dns_cache=self.valves.dns_cache_ttl,
                     use_dns_cache=True,
                     enable_cleanup_closed=True,
                     force_close=False,
-                    keepalive_timeout=30
+                    keepalive_timeout=self.valves.connection_keepalive_timeout
                 )
             
             # Create session with comprehensive timeout configuration
@@ -3725,6 +3809,298 @@ Your output must be valid JSON only. No additional text.""",
             "session_open": self._aiohttp_session is not None and not self._aiohttp_session.closed if self._aiohttp_session else False,
             "connector_open": self._session_connector is not None and not self._session_connector.closed if self._session_connector else False
         }
+    
+    async def _diagnose_connection_issues(self, api_url: str, provider_type: str, error: Exception) -> Dict[str, Any]:
+        """Comprehensive connection diagnostics to identify specific failure reasons"""
+        key = self._get_circuit_breaker_key(api_url, provider_type)
+        diagnostics = {
+            "endpoint": api_url,
+            "provider": provider_type,
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "timestamp": time.time(),
+            "tests": {}
+        }
+        
+        if not self.valves.enable_connection_diagnostics:
+            diagnostics["tests"]["diagnostics_disabled"] = True
+            return diagnostics
+        
+        try:
+            session = await self._get_aiohttp_session()
+            
+            # Test 1: Basic connectivity (no API call, just connection)
+            try:
+                from urllib.parse import urlparse
+                parsed_url = urlparse(api_url)
+                base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                
+                async with session.get(base_url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                    diagnostics["tests"]["basic_connectivity"] = {
+                        "status": "success",
+                        "response_code": response.status,
+                        "response_time": time.time() - diagnostics["timestamp"]
+                    }
+            except Exception as e:
+                diagnostics["tests"]["basic_connectivity"] = {
+                    "status": "failed",
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                }
+            
+            # Test 2: API Key validation (if applicable)
+            if provider_type in ["openai_compatible", "gemini"]:
+                if not self.valves.llm_api_key:
+                    diagnostics["tests"]["api_key_validation"] = {
+                        "status": "failed",
+                        "error": "API key not configured"
+                    }
+                elif not self.valves.llm_api_key.strip():
+                    diagnostics["tests"]["api_key_validation"] = {
+                        "status": "failed", 
+                        "error": "API key is empty"
+                    }
+                else:
+                    diagnostics["tests"]["api_key_validation"] = {
+                        "status": "success",
+                        "key_length": len(self.valves.llm_api_key),
+                        "key_format": "Bearer token configured"
+                    }
+            else:
+                diagnostics["tests"]["api_key_validation"] = {
+                    "status": "not_required",
+                    "provider": provider_type
+                }
+            
+            # Test 3: Endpoint format validation
+            endpoint_issues = []
+            if not api_url.startswith(("http://", "https://")):
+                endpoint_issues.append("URL must start with http:// or https://")
+            if "localhost" in api_url and provider_type == "ollama":
+                endpoint_issues.append("Consider using host.docker.internal instead of localhost for Docker deployments")
+            if not api_url.endswith("/chat") and provider_type == "ollama":
+                endpoint_issues.append("Ollama API endpoint should typically end with /api/chat")
+            if "/v1/" not in api_url and provider_type in ["openai_compatible", "gemini"]:
+                endpoint_issues.append("OpenAI-compatible APIs typically include /v1/ in the path")
+                
+            diagnostics["tests"]["endpoint_format"] = {
+                "status": "success" if not endpoint_issues else "warnings",
+                "issues": endpoint_issues,
+                "url": api_url
+            }
+            
+            # Test 4: Model availability (light test)
+            try:
+                test_data = {
+                    "model": self.valves.llm_model_name,
+                    "messages": [{"role": "user", "content": "test"}],
+                    "max_tokens": 1
+                }
+                
+                headers = {"Content-Type": "application/json"}
+                if provider_type in ["openai_compatible", "gemini"] and self.valves.llm_api_key:
+                    headers["Authorization"] = f"Bearer {self.valves.llm_api_key}"
+                
+                async with session.post(
+                    api_url,
+                    json=test_data,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15)
+                ) as response:
+                    if response.status == 200:
+                        diagnostics["tests"]["model_availability"] = {
+                            "status": "success",
+                            "model": self.valves.llm_model_name,
+                            "response_code": response.status
+                        }
+                    elif response.status == 401:
+                        diagnostics["tests"]["model_availability"] = {
+                            "status": "failed",
+                            "error": "Authentication failed - check API key",
+                            "response_code": response.status
+                        }
+                    elif response.status == 404:
+                        diagnostics["tests"]["model_availability"] = {
+                            "status": "failed", 
+                            "error": f"Model '{self.valves.llm_model_name}' not found or endpoint incorrect",
+                            "response_code": response.status
+                        }
+                    elif response.status == 429:
+                        diagnostics["tests"]["model_availability"] = {
+                            "status": "rate_limited",
+                            "error": "Rate limited - too many requests",
+                            "response_code": response.status
+                        }
+                    else:
+                        error_text = await response.text()
+                        diagnostics["tests"]["model_availability"] = {
+                            "status": "failed",
+                            "error": f"HTTP {response.status}: {error_text[:200]}",
+                            "response_code": response.status
+                        }
+                        
+            except asyncio.TimeoutError:
+                diagnostics["tests"]["model_availability"] = {
+                    "status": "failed",
+                    "error": "Request timed out - endpoint may be slow or unresponsive"
+                }
+            except Exception as e:
+                diagnostics["tests"]["model_availability"] = {
+                    "status": "failed",
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                }
+            
+            # Test 5: Circuit breaker status
+            cb_state = self._circuit_breaker_state.get(key, {})
+            diagnostics["tests"]["circuit_breaker"] = {
+                "status": "open" if cb_state.get("is_open", False) else "closed",
+                "failure_count": cb_state.get("failures", 0),
+                "last_failure": cb_state.get("last_failure", 0),
+                "threshold": self.valves.circuit_breaker_failure_threshold
+            }
+            
+        except Exception as diag_error:
+            diagnostics["tests"]["diagnostic_error"] = {
+                "status": "failed",
+                "error": f"Diagnostics failed: {str(diag_error)}"
+            }
+        
+        return diagnostics
+    
+    async def _get_connection_troubleshooting_tips(self, diagnostics: Dict[str, Any]) -> List[str]:
+        """Generate specific troubleshooting tips based on diagnostics"""
+        tips = []
+        tests = diagnostics.get("tests", {})
+        provider = diagnostics.get("provider", "unknown")
+        
+        # Connectivity issues
+        if tests.get("basic_connectivity", {}).get("status") == "failed":
+            tips.append("🔌 Basic connectivity failed - check if the server is running and accessible")
+            if "localhost" in diagnostics.get("endpoint", ""):
+                tips.append("💡 If running in Docker, try changing 'localhost' to 'host.docker.internal'")
+        
+        # API key issues
+        api_key_test = tests.get("api_key_validation", {})
+        if api_key_test.get("status") == "failed":
+            if "not configured" in api_key_test.get("error", ""):
+                tips.append("🗝️ API key is required but not configured - add it in the valves settings")
+            elif "empty" in api_key_test.get("error", ""):
+                tips.append("🗝️ API key is empty - check the valves configuration")
+        
+        # Model issues
+        model_test = tests.get("model_availability", {})
+        if model_test.get("status") == "failed":
+            if model_test.get("response_code") == 404:
+                if provider == "ollama":
+                    tips.append(f"📦 Model '{diagnostics.get('endpoint', '').split('/')[-1]}' not found in Ollama - try 'ollama pull <model>' first")
+                else:
+                    tips.append("📦 Model not found - check the model name in valves settings")
+            elif model_test.get("response_code") == 401:
+                tips.append("🔐 Authentication failed - verify your API key is correct and has proper permissions")
+        elif model_test.get("status") == "rate_limited":
+            tips.append("🚦 Rate limited - wait a moment or check your API usage limits")
+        
+        # Endpoint format issues
+        endpoint_test = tests.get("endpoint_format", {})
+        if endpoint_test.get("status") == "warnings":
+            for issue in endpoint_test.get("issues", []):
+                tips.append(f"⚠️ {issue}")
+        
+        # Circuit breaker issues
+        cb_test = tests.get("circuit_breaker", {})
+        if cb_test.get("status") == "open":
+            tips.append(f"🔴 Circuit breaker is open due to {cb_test.get('failure_count', 0)} consecutive failures")
+            tips.append("⏱️ Wait for the circuit breaker to reset or restart the plugin to reset it manually")
+        
+        # General tips
+        if provider == "ollama":
+            tips.append("🦙 For Ollama: Ensure the service is running with 'ollama serve' and the model is pulled")
+        elif provider in ["openai_compatible", "gemini"]:
+            tips.append("🌐 For API-based providers: Check your internet connection and API service status")
+        
+        return tips
+    
+    def reset_circuit_breakers(self, api_url: Optional[str] = None, provider_type: Optional[str] = None) -> Dict[str, Any]:
+        """Reset circuit breakers for troubleshooting - can reset specific endpoint or all"""
+        reset_info = {
+            "reset_count": 0,
+            "reset_endpoints": []
+        }
+        
+        if api_url and provider_type:
+            # Reset specific endpoint
+            key = self._get_circuit_breaker_key(api_url, provider_type)
+            if key in self._circuit_breaker_state:
+                self._circuit_breaker_state[key] = {"failures": 0, "last_failure": 0, "is_open": False}
+                reset_info["reset_count"] = 1
+                reset_info["reset_endpoints"].append(key)
+                logger.info(f"Reset circuit breaker for {key}")
+        else:
+            # Reset all circuit breakers
+            reset_info["reset_count"] = len(self._circuit_breaker_state)
+            reset_info["reset_endpoints"] = list(self._circuit_breaker_state.keys())
+            self._circuit_breaker_state.clear()
+            logger.info("Reset all circuit breakers")
+        
+        return reset_info
+    
+    async def test_llm_connection(self, timeout: float = 30.0) -> Dict[str, Any]:
+        """Test LLM connection with comprehensive reporting"""
+        provider_type = self.valves.llm_provider_type
+        api_url = self.valves.llm_api_endpoint_url
+        model_name = self.valves.llm_model_name
+        
+        test_result = {
+            "provider": provider_type,
+            "endpoint": api_url, 
+            "model": model_name,
+            "timestamp": time.time(),
+            "success": False,
+            "response_time": 0.0,
+            "error": None,
+            "diagnostics": None
+        }
+        
+        start_time = time.time()
+        
+        try:
+            # Simple test message
+            test_response = await asyncio.wait_for(
+                self.query_llm_with_retry(
+                    "You are a connection test assistant.",
+                    "Reply with exactly: TEST_SUCCESSFUL"
+                ),
+                timeout=timeout
+            )
+            
+            test_result["response_time"] = time.time() - start_time
+            
+            if "TEST_SUCCESSFUL" in test_response and not test_response.startswith("Error:"):
+                test_result["success"] = True
+                test_result["response"] = test_response
+            else:
+                test_result["error"] = f"Unexpected response: {test_response[:100]}..."
+                if test_response.startswith("Error:"):
+                    test_result["error"] = test_response
+                
+        except asyncio.TimeoutError:
+            test_result["error"] = f"Connection test timed out after {timeout} seconds"
+            test_result["response_time"] = timeout
+        except Exception as e:
+            test_result["error"] = str(e)
+            test_result["response_time"] = time.time() - start_time
+        
+        # Add diagnostics on failure
+        if not test_result["success"]:
+            try:
+                test_result["diagnostics"] = await self._diagnose_connection_issues(
+                    api_url, provider_type, Exception(test_result["error"] or "Test failed")
+                )
+            except Exception as e:
+                test_result["diagnostics_error"] = str(e)
+        
+        return test_result
 
     async def async_inlet(
         self,
@@ -3737,7 +4113,8 @@ Your output must be valid JSON only. No additional text.""",
 
         Handles chat commands: /memory list, /memory forget [id], /memory edit [id] [new content],
         /memory summarize [topic/tag], /note [content], /memory mark_important [id],
-        /memory unmark_important [id], /memory list_banks, /memory assign_bank [id] [bank]
+        /memory unmark_important [id], /memory list_banks, /memory assign_bank [id] [bank],
+        /diagnose (LLM connection diagnostics), /reset circuit (reset circuit breakers)
         """
         try:
             # Add timeout protection to entire inlet operation
@@ -4002,6 +4379,190 @@ Your output must be valid JSON only. No additional text.""",
                  body["prompt"] = "Note command received." # Placeholder
                  body["bypass_prompt_processing"] = True
                  return body
+
+            # --- /diagnose command - LLM Connection Diagnostics ---
+            elif command == "/diagnose":
+                logger.info(f"Handling /diagnose command for user {user_id}")
+                
+                await self._safe_emit(__event_emitter__, {
+                    "type": "status", 
+                    "data": {
+                        "description": "🔍 Running LLM connection diagnostics...",
+                        "done": False
+                    }
+                })
+                
+                try:
+                    # Test current LLM configuration
+                    provider_type = self.valves.llm_provider_type
+                    api_url = self.valves.llm_api_endpoint_url
+                    model_name = self.valves.llm_model_name
+                    
+                    # Perform comprehensive diagnostics
+                    test_error = Exception("Diagnostic test")
+                    diagnostics = await self._diagnose_connection_issues(api_url, provider_type, test_error)
+                    tips = await self._get_connection_troubleshooting_tips(diagnostics)
+                    
+                    # Prepare diagnostic report
+                    report_lines = [
+                        f"🔧 **LLM Connection Diagnostics Report**",
+                        f"📍 Provider: `{provider_type}` | Model: `{model_name}`",
+                        f"🌐 Endpoint: `{api_url}`",
+                        "",
+                        "**Test Results:**"
+                    ]
+                    
+                    tests = diagnostics.get("tests", {})
+                    for test_name, result in tests.items():
+                        status = result.get("status", "unknown")
+                        if status == "success":
+                            report_lines.append(f"✅ {test_name.replace('_', ' ').title()}")
+                        elif status == "failed":
+                            error = result.get("error", "Unknown error")
+                            report_lines.append(f"❌ {test_name.replace('_', ' ').title()}: {error}")
+                        elif status == "warnings":
+                            issues = result.get("issues", [])
+                            report_lines.append(f"⚠️ {test_name.replace('_', ' ').title()}: {len(issues)} warnings")
+                        elif status == "rate_limited":
+                            report_lines.append(f"🚦 {test_name.replace('_', ' ').title()}: Rate limited")
+                        elif status == "not_required":
+                            report_lines.append(f"ℹ️ {test_name.replace('_', ' ').title()}: Not required")
+                    
+                    if tips:
+                        report_lines.extend(["", "**Troubleshooting Tips:**"])
+                        for tip in tips[:5]:  # Limit to top 5 tips
+                            report_lines.append(f"💡 {tip}")
+                    
+                    # Test connection with actual ping
+                    try:
+                        await self._safe_emit(__event_emitter__, {
+                            "type": "status", 
+                            "data": {
+                                "description": "🔗 Testing live connection...",
+                                "done": False
+                            }
+                        })
+                        
+                        # Simple test call to the LLM
+                        test_response = await self.query_llm_with_retry(
+                            "You are a test assistant.", 
+                            "Respond with 'Connection test successful' if you receive this message."
+                        )
+                        
+                        if "Connection test successful" in test_response or not test_response.startswith("Error:"):
+                            report_lines.extend(["", "🟢 **Live Connection Test: PASSED**"])
+                        else:
+                            report_lines.extend(["", f"🔴 **Live Connection Test: FAILED**", f"Response: {test_response[:100]}..."])
+                            
+                    except Exception as live_test_error:
+                        report_lines.extend(["", f"🔴 **Live Connection Test: ERROR**", f"Error: {str(live_test_error)[:100]}..."])
+                    
+                    # Get connection stats
+                    stats = self.get_connection_stats()
+                    cb_count = len([k for k, v in stats.get("circuit_breakers", {}).items() if v.get("is_open", False)])
+                    
+                    report_lines.extend([
+                        "",
+                        "**Connection Statistics:**",
+                        f"🔵 Circuit Breakers Open: {cb_count}",
+                        f"🔗 Session Active: {'Yes' if stats.get('session_open', False) else 'No'}",
+                        f"🔌 Connector Active: {'Yes' if stats.get('connector_open', False) else 'No'}"
+                    ])
+                    
+                    diagnostic_report = "\n".join(report_lines)
+                    
+                    await self._safe_emit(__event_emitter__, {
+                        "type": "status", 
+                        "data": {
+                            "description": "✅ Diagnostics complete",
+                            "done": True
+                        }
+                    })
+                    
+                    # Return the diagnostic report as the response
+                    body["messages"] = [{
+                        "role": "assistant",
+                        "content": diagnostic_report
+                    }]
+                    body["prompt"] = "Diagnostic report generated."
+                    body["bypass_prompt_processing"] = True
+                    return body
+                    
+                except Exception as diag_error:
+                    logger.error(f"Diagnostic command failed: {diag_error}")
+                    await self._safe_emit(__event_emitter__, {
+                        "type": "status", 
+                        "data": {
+                            "description": f"❌ Diagnostics failed: {str(diag_error)[:50]}...",
+                            "done": True
+                        }
+                    })
+                    
+                    error_report = f"🔴 **Diagnostic Error**\n\nFailed to run diagnostics: {str(diag_error)}\n\nBasic info:\n- Provider: {self.valves.llm_provider_type}\n- Endpoint: {self.valves.llm_api_endpoint_url}\n- Model: {self.valves.llm_model_name}"
+                    
+                    body["messages"] = [{
+                        "role": "assistant", 
+                        "content": error_report
+                    }]
+                    body["prompt"] = "Diagnostic error occurred."
+                    body["bypass_prompt_processing"] = True
+                    return body
+
+            # --- /reset command - Reset Circuit Breakers ---
+            elif command == "/reset":
+                logger.info(f"Handling /reset command for user {user_id}")
+                
+                try:
+                    # Check if specific endpoint is requested
+                    if len(command_parts) > 1 and command_parts[1].lower() == "circuit":
+                        reset_info = self.reset_circuit_breakers()
+                        
+                        if reset_info["reset_count"] > 0:
+                            reset_report = f"🔄 **Circuit Breakers Reset**\n\n✅ Reset {reset_info['reset_count']} circuit breaker(s)\n\n**Reset Endpoints:**\n"
+                            for endpoint in reset_info["reset_endpoints"]:
+                                reset_report += f"- `{endpoint}`\n"
+                        else:
+                            reset_report = "ℹ️ **No Circuit Breakers to Reset**\n\nAll circuit breakers are already in normal state."
+                        
+                        await self._safe_emit(__event_emitter__, {
+                            "type": "status", 
+                            "data": {
+                                "description": f"✅ Reset {reset_info['reset_count']} circuit breakers",
+                                "done": True
+                            }
+                        })
+                        
+                        body["messages"] = [{
+                            "role": "assistant",
+                            "content": reset_report
+                        }]
+                        body["prompt"] = "Circuit breakers reset."
+                        body["bypass_prompt_processing"] = True
+                        return body
+                    
+                    else:
+                        # Show help for reset command
+                        help_text = "🔄 **Reset Command Help**\n\nAvailable options:\n- `/reset circuit` - Reset all LLM connection circuit breakers\n\nCircuit breakers automatically prevent requests to failing endpoints. Use this command if you've fixed connection issues and want to retry immediately."
+                        
+                        body["messages"] = [{
+                            "role": "assistant",
+                            "content": help_text
+                        }]
+                        body["prompt"] = "Reset command help."
+                        body["bypass_prompt_processing"] = True
+                        return body
+                        
+                except Exception as reset_error:
+                    logger.error(f"Reset command failed: {reset_error}")
+                    error_report = f"🔴 **Reset Error**\n\nFailed to reset: {str(reset_error)}"
+                    
+                    body["messages"] = [{
+                        "role": "assistant", 
+                        "content": error_report
+                    }]
+                    body["prompt"] = "Reset error occurred."
+                    body["bypass_prompt_processing"] = True
+                    return body
 
         # --- Memory Injection --- #
         if self.valves.show_memories and not self._embedding_feature_guard_active: # Guard embedding-dependent retrieval
@@ -5716,6 +6277,596 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             logger.warning(f"Error in enhanced similarity calculation, falling back to text-based: {e}")
             return self._calculate_memory_similarity(memory1, memory2), "text_fallback"
 
+    # ----------------------------
+    # LSH (Locality Sensitive Hashing) Implementation
+    # ----------------------------
+    
+    class LSHIndex:
+        """
+        Locality Sensitive Hashing index for efficient duplicate detection.
+        
+        Uses band-based LSH to group similar MinHash signatures together,
+        reducing the number of pairwise comparisons needed.
+        """
+        
+        def __init__(self, num_bands: int = 16, rows_per_band: int = 8):
+            """
+            Initialize LSH index.
+            
+            Args:
+                num_bands: Number of bands to use (more bands = higher precision, more memory)
+                rows_per_band: Number of rows per band (affects sensitivity)
+            """
+            self.num_bands = num_bands
+            self.rows_per_band = rows_per_band
+            self.signature_length = num_bands * rows_per_band
+            
+            # Hash tables for each band
+            self.bands = [dict() for _ in range(num_bands)]
+            
+            # Store original signatures by memory ID
+            self.signatures = {}  # memory_id -> signature
+            self.memory_ids = set()  # Track all memory IDs
+            
+        def _hash_band(self, band_values: List[int]) -> int:
+            """Hash a band's values to create a bucket key."""
+            # Use a simple hash of the concatenated values
+            return hash(tuple(band_values)) % (2**32 - 1)
+        
+        def add_signature(self, memory_id: str, signature: List[int]) -> bool:
+            """
+            Add a MinHash signature to the LSH index.
+            
+            Args:
+                memory_id: Unique identifier for the memory
+                signature: MinHash signature
+                
+            Returns:
+                True if added successfully, False if signature length mismatch
+            """
+            if len(signature) != self.signature_length:
+                # Try to adapt signature length if needed
+                if len(signature) > self.signature_length:
+                    signature = signature[:self.signature_length]
+                else:
+                    # Pad with zeros if too short
+                    signature = signature + [0] * (self.signature_length - len(signature))
+            
+            # Store the signature
+            self.signatures[memory_id] = signature
+            self.memory_ids.add(memory_id)
+            
+            # Add to each band
+            for band_idx in range(self.num_bands):
+                start_idx = band_idx * self.rows_per_band
+                end_idx = start_idx + self.rows_per_band
+                band_values = signature[start_idx:end_idx]
+                
+                band_hash = self._hash_band(band_values)
+                
+                if band_hash not in self.bands[band_idx]:
+                    self.bands[band_idx][band_hash] = set()
+                
+                self.bands[band_idx][band_hash].add(memory_id)
+            
+            return True
+        
+        def remove_signature(self, memory_id: str) -> bool:
+            """
+            Remove a signature from the LSH index.
+            
+            Args:
+                memory_id: Unique identifier for the memory
+                
+            Returns:
+                True if removed successfully, False if not found
+            """
+            if memory_id not in self.signatures:
+                return False
+            
+            signature = self.signatures[memory_id]
+            
+            # Remove from each band
+            for band_idx in range(self.num_bands):
+                start_idx = band_idx * self.rows_per_band
+                end_idx = start_idx + self.rows_per_band
+                band_values = signature[start_idx:end_idx]
+                
+                band_hash = self._hash_band(band_values)
+                
+                if band_hash in self.bands[band_idx]:
+                    self.bands[band_idx][band_hash].discard(memory_id)
+                    
+                    # Clean up empty buckets
+                    if not self.bands[band_idx][band_hash]:
+                        del self.bands[band_idx][band_hash]
+            
+            # Remove from storage
+            del self.signatures[memory_id]
+            self.memory_ids.discard(memory_id)
+            
+            return True
+        
+        def find_candidates(self, signature: List[int]) -> Set[str]:
+            """
+            Find candidate memory IDs that might be similar to the given signature.
+            
+            Args:
+                signature: MinHash signature to find candidates for
+                
+            Returns:
+                Set of memory IDs that are candidates for similarity
+            """
+            if len(signature) != self.signature_length:
+                # Adapt signature length if needed
+                if len(signature) > self.signature_length:
+                    signature = signature[:self.signature_length]
+                else:
+                    signature = signature + [0] * (self.signature_length - len(signature))
+            
+            candidates = set()
+            
+            # Check each band for matches
+            for band_idx in range(self.num_bands):
+                start_idx = band_idx * self.rows_per_band
+                end_idx = start_idx + self.rows_per_band
+                band_values = signature[start_idx:end_idx]
+                
+                band_hash = self._hash_band(band_values)
+                
+                if band_hash in self.bands[band_idx]:
+                    candidates.update(self.bands[band_idx][band_hash])
+            
+            return candidates
+        
+        def get_signature(self, memory_id: str) -> Optional[List[int]]:
+            """Get the stored signature for a memory ID."""
+            return self.signatures.get(memory_id)
+        
+        def size(self) -> int:
+            """Get the number of signatures in the index."""
+            return len(self.signatures)
+        
+        def clear(self) -> None:
+            """Clear all signatures from the index."""
+            self.bands = [dict() for _ in range(self.num_bands)]
+            self.signatures.clear()
+            self.memory_ids.clear()
+    
+    def _get_lsh_index(self) -> 'LSHIndex':
+        """
+        Get or create the LSH index for efficient duplicate detection.
+        
+        Returns:
+            LSH index instance
+        """
+        # Initialize LSH index if not already done or if configuration changed
+        expected_signature_length = self.valves.fingerprint_num_hashes
+        
+        if not hasattr(self, '_lsh_index') or \
+           getattr(self, '_cached_lsh_signature_length', 0) != expected_signature_length:
+            
+            # Calculate optimal LSH parameters based on signature length
+            # Rule of thumb: bands * rows_per_band = signature_length
+            # More bands = higher precision, fewer false positives
+            # More rows per band = higher recall, fewer false negatives
+            
+            if expected_signature_length >= 128:
+                num_bands = 16
+                rows_per_band = expected_signature_length // num_bands
+            elif expected_signature_length >= 64:
+                num_bands = 8
+                rows_per_band = expected_signature_length // num_bands
+            else:
+                num_bands = 4
+                rows_per_band = max(1, expected_signature_length // num_bands)
+            
+            self._lsh_index = self.LSHIndex(num_bands=num_bands, rows_per_band=rows_per_band)
+            self._cached_lsh_signature_length = expected_signature_length
+            
+            logger.debug(f"Initialized LSH index with {num_bands} bands, {rows_per_band} rows per band")
+        
+        return self._lsh_index
+    
+    def _populate_lsh_index(self, existing_memories: List[Dict[str, Any]]) -> None:
+        """
+        Populate the LSH index with existing memories.
+        
+        Args:
+            existing_memories: List of existing memory dictionaries
+        """
+        lsh_index = self._get_lsh_index()
+        
+        # Clear and repopulate the index
+        lsh_index.clear()
+        
+        logger.debug(f"Populating LSH index with {len(existing_memories)} existing memories")
+        
+        for memory in existing_memories:
+            memory_id = memory.get("id")
+            memory_content = memory.get("memory", "")
+            
+            if memory_id and memory_content:
+                try:
+                    # Generate fingerprint for this memory
+                    fingerprint = self._get_memory_fingerprint(memory_content)
+                    
+                    # Add to LSH index
+                    lsh_index.add_signature(memory_id, fingerprint)
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to add memory {memory_id} to LSH index: {e}")
+        
+        logger.debug(f"LSH index populated with {lsh_index.size()} signatures")
+    
+    def _find_lsh_candidates(self, memory_content: str) -> Set[str]:
+        """
+        Find candidate memory IDs that might be duplicates using LSH.
+        
+        Args:
+            memory_content: Content of the new memory
+            
+        Returns:
+            Set of memory IDs that are candidates for duplicate checking
+        """
+        try:
+            # Generate fingerprint for the new memory
+            fingerprint = self._get_memory_fingerprint(memory_content)
+            
+            # Find candidates using LSH
+            lsh_index = self._get_lsh_index()
+            candidates = lsh_index.find_candidates(fingerprint)
+            
+            logger.debug(f"LSH found {len(candidates)} candidates for similarity checking")
+            return candidates
+            
+        except Exception as e:
+            logger.warning(f"Error in LSH candidate finding: {e}")
+            # Return empty set on error - will fall back to full comparison
+            return set()
+
+    # ----------------------------
+    # Enhanced Confidence Scoring System
+    # ----------------------------
+    
+    @dataclass
+    class DuplicateConfidenceScore:
+        """
+        Comprehensive confidence score for duplicate detection.
+        """
+        fingerprint_similarity: float = 0.0
+        text_similarity: float = 0.0
+        embedding_similarity: float = 0.0
+        semantic_similarity: float = 0.0
+        length_similarity: float = 0.0
+        tag_overlap: float = 0.0
+        temporal_proximity: float = 0.0
+        content_type_match: float = 0.0
+        
+        # Aggregated scores
+        combined_score: float = 0.0
+        confidence_level: str = "low"  # low, medium, high
+        
+        # Decision factors
+        is_duplicate: bool = False
+        primary_method: str = ""
+        decision_factors: List[str] = field(default_factory=list)
+    
+    def _calculate_enhanced_confidence_score(
+        self, 
+        new_content: str, 
+        existing_content: str,
+        new_memory_data: Dict[str, Any] = None,
+        existing_memory_data: Dict[str, Any] = None
+    ) -> DuplicateConfidenceScore:
+        """
+        Calculate comprehensive confidence score for duplicate detection.
+        
+        Args:
+            new_content: Content of the new memory
+            existing_content: Content of the existing memory
+            new_memory_data: Optional metadata for new memory
+            existing_memory_data: Optional metadata for existing memory
+            
+        Returns:
+            DuplicateConfidenceScore object with detailed analysis
+        """
+        score = self.DuplicateConfidenceScore()
+        
+        # Ensure we have memory data objects
+        if new_memory_data is None:
+            new_memory_data = {"content": new_content, "tags": []}
+        if existing_memory_data is None:
+            existing_memory_data = {"memory": existing_content, "tags": []}
+        
+        try:
+            # 1. Fingerprint Similarity (if fingerprinting enabled)
+            if self.valves.use_fingerprinting:
+                try:
+                    fingerprint1 = self._get_memory_fingerprint(new_content)
+                    fingerprint2 = self._get_memory_fingerprint(existing_content)
+                    score.fingerprint_similarity = self._calculate_fingerprint_similarity(fingerprint1, fingerprint2)
+                except Exception as e:
+                    logger.debug(f"Error calculating fingerprint similarity: {e}")
+                    score.fingerprint_similarity = 0.0
+            
+            # 2. Text Similarity (always calculated as baseline)
+            score.text_similarity = self._calculate_memory_similarity(new_content, existing_content)
+            
+            # 3. Embedding Similarity (if embeddings available)
+            if self.valves.use_embeddings_for_deduplication and self._local_embedding_model:
+                try:
+                    # Calculate embedding similarity
+                    embedding_sim = asyncio.run(self._calculate_embedding_similarity(new_content, existing_content))
+                    score.embedding_similarity = embedding_sim
+                except Exception as e:
+                    logger.debug(f"Error calculating embedding similarity: {e}")
+                    score.embedding_similarity = 0.0
+            
+            # 4. Length Similarity
+            len1, len2 = len(new_content.strip()), len(existing_content.strip())
+            if len1 > 0 and len2 > 0:
+                score.length_similarity = 1.0 - abs(len1 - len2) / max(len1, len2)
+            else:
+                score.length_similarity = 1.0 if len1 == len2 == 0 else 0.0
+            
+            # 5. Tag Overlap (if available)
+            new_tags = set(new_memory_data.get("tags", []))
+            existing_tags = set(existing_memory_data.get("tags", []))
+            if new_tags or existing_tags:
+                if new_tags and existing_tags:
+                    intersection = len(new_tags.intersection(existing_tags))
+                    union = len(new_tags.union(existing_tags))
+                    score.tag_overlap = intersection / union if union > 0 else 0.0
+                else:
+                    score.tag_overlap = 0.0
+            else:
+                score.tag_overlap = 0.5  # Neutral when no tags available
+            
+            # 6. Temporal Proximity (if timestamps available)
+            score.temporal_proximity = self._calculate_temporal_similarity(new_memory_data, existing_memory_data)
+            
+            # 7. Content Type Matching
+            score.content_type_match = self._calculate_content_type_similarity(new_content, existing_content)
+            
+            # 8. Calculate Combined Score using weighted average
+            weights = self._get_confidence_score_weights()
+            score.combined_score = (
+                weights["fingerprint"] * score.fingerprint_similarity +
+                weights["text"] * score.text_similarity +
+                weights["embedding"] * score.embedding_similarity +
+                weights["length"] * score.length_similarity +
+                weights["tag"] * score.tag_overlap +
+                weights["temporal"] * score.temporal_proximity +
+                weights["content_type"] * score.content_type_match
+            )
+            
+            # 9. Determine confidence level and decision
+            score.confidence_level = self._classify_confidence_level(score.combined_score)
+            score.is_duplicate, score.primary_method, score.decision_factors = self._make_duplicate_decision(score)
+            
+            logger.debug(f"Enhanced confidence score: combined={score.combined_score:.3f}, "
+                        f"level={score.confidence_level}, duplicate={score.is_duplicate}")
+            
+            return score
+            
+        except Exception as e:
+            logger.error(f"Error in enhanced confidence scoring: {e}")
+            # Return minimal score with fallback to text similarity
+            score.text_similarity = self._calculate_memory_similarity(new_content, existing_content)
+            score.combined_score = score.text_similarity
+            score.confidence_level = "low"
+            score.is_duplicate = score.combined_score >= self.valves.similarity_threshold
+            score.primary_method = "text_fallback"
+            score.decision_factors = ["error_fallback"]
+            return score
+    
+    def _get_confidence_score_weights(self) -> Dict[str, float]:
+        """
+        Get weights for different similarity components.
+        
+        Returns:
+            Dictionary of component weights (should sum to 1.0)
+        """
+        # Default weights - can be made configurable via valves in the future
+        if self.valves.use_fingerprinting and self.valves.use_embeddings_for_deduplication:
+            # All methods available - prefer fingerprinting and embeddings
+            return {
+                "fingerprint": 0.35,
+                "text": 0.15,
+                "embedding": 0.25,
+                "length": 0.10,
+                "tag": 0.05,
+                "temporal": 0.05,
+                "content_type": 0.05
+            }
+        elif self.valves.use_fingerprinting:
+            # Fingerprinting available but not embeddings
+            return {
+                "fingerprint": 0.40,
+                "text": 0.25,
+                "embedding": 0.0,
+                "length": 0.15,
+                "tag": 0.08,
+                "temporal": 0.07,
+                "content_type": 0.05
+            }
+        elif self.valves.use_embeddings_for_deduplication:
+            # Embeddings available but not fingerprinting
+            return {
+                "fingerprint": 0.0,
+                "text": 0.25,
+                "embedding": 0.40,
+                "length": 0.15,
+                "tag": 0.08,
+                "temporal": 0.07,
+                "content_type": 0.05
+            }
+        else:
+            # Only text-based methods available
+            return {
+                "fingerprint": 0.0,
+                "text": 0.50,
+                "embedding": 0.0,
+                "length": 0.20,
+                "tag": 0.12,
+                "temporal": 0.10,
+                "content_type": 0.08
+            }
+    
+    def _calculate_temporal_similarity(self, new_data: Dict[str, Any], existing_data: Dict[str, Any]) -> float:
+        """
+        Calculate temporal similarity between two memories.
+        
+        Args:
+            new_data: New memory metadata
+            existing_data: Existing memory metadata
+            
+        Returns:
+            Temporal similarity score [0.0, 1.0]
+        """
+        try:
+            # Extract timestamps if available
+            new_timestamp = new_data.get("created_at") or new_data.get("timestamp")
+            existing_timestamp = existing_data.get("created_at") or existing_data.get("timestamp")
+            
+            if not new_timestamp or not existing_timestamp:
+                return 0.5  # Neutral score when timestamps unavailable
+            
+            # Parse timestamps
+            if isinstance(new_timestamp, str):
+                new_time = datetime.fromisoformat(new_timestamp.replace('Z', '+00:00'))
+            else:
+                new_time = new_timestamp
+            
+            if isinstance(existing_timestamp, str):
+                existing_time = datetime.fromisoformat(existing_timestamp.replace('Z', '+00:00'))
+            else:
+                existing_time = existing_timestamp
+            
+            # Calculate time difference
+            time_diff = abs((new_time - existing_time).total_seconds())
+            
+            # Score based on time proximity (closer in time = higher score)
+            # Within 1 hour = 1.0, within 1 day = 0.5, within 1 week = 0.1, beyond = 0.0
+            if time_diff < 3600:  # 1 hour
+                return 1.0
+            elif time_diff < 86400:  # 1 day
+                return 0.5
+            elif time_diff < 604800:  # 1 week
+                return 0.1
+            else:
+                return 0.0
+            
+        except Exception as e:
+            logger.debug(f"Error calculating temporal similarity: {e}")
+            return 0.5  # Neutral score on error
+    
+    def _calculate_content_type_similarity(self, content1: str, content2: str) -> float:
+        """
+        Calculate content type similarity (e.g., both preferences, both facts, etc.).
+        
+        Args:
+            content1: First content string
+            content2: Second content string
+            
+        Returns:
+            Content type similarity score [0.0, 1.0]
+        """
+        try:
+            # Define content type patterns
+            preference_patterns = r'\b(like|love|prefer|enjoy|favorite|hate|dislike)\b'
+            fact_patterns = r'\b(is|was|are|were|born|lives|works|studied)\b'
+            goal_patterns = r'\b(want|plan|goal|intend|hope|wish|dream)\b'
+            relationship_patterns = r'\b(friend|family|brother|sister|mother|father|spouse|partner)\b'
+            
+            # Check content types for both strings
+            def get_content_type(text):
+                text_lower = text.lower()
+                types = []
+                if re.search(preference_patterns, text_lower):
+                    types.append("preference")
+                if re.search(fact_patterns, text_lower):
+                    types.append("fact")
+                if re.search(goal_patterns, text_lower):
+                    types.append("goal")
+                if re.search(relationship_patterns, text_lower):
+                    types.append("relationship")
+                return set(types) if types else {"general"}
+            
+            types1 = get_content_type(content1)
+            types2 = get_content_type(content2)
+            
+            # Calculate overlap
+            intersection = len(types1.intersection(types2))
+            union = len(types1.union(types2))
+            
+            return intersection / union if union > 0 else 0.0
+            
+        except Exception as e:
+            logger.debug(f"Error calculating content type similarity: {e}")
+            return 0.5  # Neutral score on error
+    
+    def _classify_confidence_level(self, combined_score: float) -> str:
+        """
+        Classify confidence level based on combined score.
+        
+        Args:
+            combined_score: Combined similarity score [0.0, 1.0]
+            
+        Returns:
+            Confidence level: "low", "medium", or "high"
+        """
+        if combined_score >= 0.85:
+            return "high"
+        elif combined_score >= 0.65:
+            return "medium"
+        else:
+            return "low"
+    
+    def _make_duplicate_decision(self, score: 'DuplicateConfidenceScore') -> tuple[bool, str, List[str]]:
+        """
+        Make final duplicate decision based on confidence score.
+        
+        Args:
+            score: DuplicateConfidenceScore object
+            
+        Returns:
+            Tuple of (is_duplicate, primary_method, decision_factors)
+        """
+        decision_factors = []
+        
+        # Use adaptive thresholds based on available methods
+        if self.valves.use_fingerprinting:
+            fingerprint_threshold = self.valves.fingerprint_similarity_threshold
+            if score.fingerprint_similarity >= fingerprint_threshold:
+                decision_factors.append(f"fingerprint_match_{score.fingerprint_similarity:.3f}")
+                return True, "fingerprint", decision_factors
+        
+        if self.valves.use_embeddings_for_deduplication:
+            embedding_threshold = self.valves.embedding_similarity_threshold
+            if score.embedding_similarity >= embedding_threshold:
+                decision_factors.append(f"embedding_match_{score.embedding_similarity:.3f}")
+                return True, "embedding", decision_factors
+        
+        # Text similarity as fallback
+        text_threshold = self.valves.similarity_threshold
+        if score.text_similarity >= text_threshold:
+            decision_factors.append(f"text_match_{score.text_similarity:.3f}")
+            return True, "text", decision_factors
+        
+        # Check combined score with configurable threshold
+        combined_threshold = self.valves.confidence_scoring_combined_threshold
+        if score.combined_score >= combined_threshold:
+            decision_factors.append(f"combined_match_{score.combined_score:.3f}")
+            if score.confidence_level == "high":
+                decision_factors.append("high_confidence")
+            return True, "combined", decision_factors
+        
+        # Not a duplicate
+        decision_factors.append(f"no_match_combined_{score.combined_score:.3f}")
+        return False, "no_match", decision_factors
+
     async def get_relevant_memories(
         self, current_message: str, user_id: str, user_timezone: str = None
     ) -> List[Dict[str, Any]]:
@@ -6151,6 +7302,20 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     f"Threshold: {threshold_to_use}"
                 )
 
+                # Determine if we should use LSH optimization
+                use_lsh = (
+                    use_fingerprinting and 
+                    self.valves.use_lsh_optimization and 
+                    len(existing_memories) >= self.valves.lsh_threshold_for_activation
+                )
+                
+                if use_lsh:
+                    logger.debug(f"Using LSH optimization for {len(existing_memories)} existing memories")
+                    # Populate LSH index with existing memories
+                    self._populate_lsh_index(existing_memories)
+                else:
+                    logger.debug(f"Using direct comparison (LSH disabled or insufficient memories: {len(existing_memories)})")
+
                 # Check each new memory against existing ones
                 for new_memory_idx, memory_dict in enumerate(memories):
                     if memory_dict["operation"] == "NEW":
@@ -6186,57 +7351,104 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                 logger.warning(f"Failed to encode new memory for deduplication; falling back to text sim. Error: {e}")
                                 use_embeddings = False  # fall back
 
-                        for existing_idx, existing_content in enumerate(existing_contents):
-                            # Determine which similarity method to use based on configuration
-                            if self.valves.use_fingerprinting:
-                                # Use enhanced fingerprinting-based similarity
-                                similarity, similarity_method = self._get_enhanced_similarity_score(
-                                    formatted_content, existing_content
+                        # Determine which memories to check based on LSH optimization
+                        if use_lsh:
+                            # Use LSH to find candidate memory IDs
+                            candidate_ids = self._find_lsh_candidates(formatted_content)
+                            logger.debug(f"LSH narrowed down to {len(candidate_ids)} candidates from {len(existing_memories)} total memories")
+                            
+                            # Build list of candidates to check
+                            candidates_to_check = []
+                            for memory in existing_memories:
+                                if memory.get("id") in candidate_ids:
+                                    candidates_to_check.append((memory.get("memory", ""), memory))
+                        else:
+                            # Check all existing memories (original behavior)
+                            candidates_to_check = [(content, existing_memories[idx]) for idx, content in enumerate(existing_contents)]
+                        
+                        # Process candidates (either LSH-filtered or all existing memories)
+                        for existing_content, existing_mem_dict in candidates_to_check:
+                            # Use enhanced confidence scoring if enabled
+                            if self.valves.use_enhanced_confidence_scoring:
+                                # Create memory data for enhanced scoring
+                                new_memory_data = {"content": formatted_content, "tags": memory_dict.get("tags", [])}
+                                confidence_score = self._calculate_enhanced_confidence_score(
+                                    formatted_content, 
+                                    existing_content,
+                                    new_memory_data=new_memory_data,
+                                    existing_memory_data=existing_mem_dict
                                 )
-                                similarity_score = similarity
-                            elif use_embeddings:
-                                # Retrieve or compute embedding for the existing memory content
-                                existing_mem_dict = existing_memories[existing_idx]
-                                existing_id = existing_mem_dict.get("id")
-                                existing_emb = self.memory_embeddings.get(existing_id)
-                                if existing_emb is None and self._local_embedding_model is not None:
-                                    try:
-                                        existing_emb = self._local_embedding_model.encode(
-                                            existing_content.lower().strip(), normalize_embeddings=True
+                                
+                                similarity_score = confidence_score.combined_score
+                                similarity_method = f"enhanced_{confidence_score.primary_method}"
+                                
+                                # Use the enhanced decision from confidence scoring
+                                if confidence_score.is_duplicate:
+                                    existing_id = existing_mem_dict.get("id", "unknown")
+                                    logger.debug(
+                                        f"  -> Enhanced duplicate found vs {existing_id} "
+                                        f"(Combined: {confidence_score.combined_score:.3f}, "
+                                        f"Level: {confidence_score.confidence_level}, "
+                                        f"Method: {confidence_score.primary_method}, "
+                                        f"Factors: {confidence_score.decision_factors})"
+                                    )
+                                    logger.debug(
+                                        f"Skipping duplicate NEW memory (enhanced confidence): {formatted_content[:50]}..."
+                                    )
+                                    is_duplicate = True
+                                    self._duplicate_skipped += 1
+                                    break
+                            else:
+                                # Fallback to original similarity methods
+                                if self.valves.use_fingerprinting:
+                                    # Use enhanced fingerprinting-based similarity
+                                    similarity, similarity_method = self._get_enhanced_similarity_score(
+                                        formatted_content, existing_content
+                                    )
+                                    similarity_score = similarity
+                                elif use_embeddings:
+                                    # Retrieve or compute embedding for the existing memory content
+                                    existing_id = existing_mem_dict.get("id")
+                                    existing_emb = self.memory_embeddings.get(existing_id)
+                                    if existing_emb is None and self._local_embedding_model is not None:
+                                        try:
+                                            existing_emb = self._local_embedding_model.encode(
+                                                existing_content.lower().strip(), normalize_embeddings=True
+                                            )
+                                            self.memory_embeddings[existing_id] = existing_emb
+                                        except Exception:
+                                            # On failure, mark duplicate check using text sim for this item
+                                            existing_emb = None
+                                    if existing_emb is not None:
+                                        similarity = float(np.dot(new_embedding, existing_emb))
+                                        similarity_score = similarity # Store score
+                                        similarity_method = 'embedding'
+                                    else:
+                                        similarity = self._calculate_memory_similarity(
+                                            formatted_content, existing_content
                                         )
-                                        self.memory_embeddings[existing_id] = existing_emb
-                                    except Exception:
-                                        # On failure, mark duplicate check using text sim for this item
-                                        existing_emb = None
-                                if existing_emb is not None:
-                                    similarity = float(np.dot(new_embedding, existing_emb))
-                                    similarity_score = similarity # Store score
-                                    similarity_method = 'embedding'
+                                        similarity_score = similarity # Store score
+                                        similarity_method = 'text'
                                 else:
+                                    # Choose the appropriate similarity calculation method
                                     similarity = self._calculate_memory_similarity(
                                         formatted_content, existing_content
                                     )
-                                    similarity_score = similarity # Store score
+                                    similarity_score = similarity
                                     similarity_method = 'text'
-                            else:
-                                # Choose the appropriate similarity calculation method
-                                similarity = self._calculate_memory_similarity(
-                                    formatted_content, existing_content
-                                )
-                                similarity_score = similarity
-                                similarity_method = 'text'
-                                
-                            if similarity >= threshold_to_use:
-                                logger.debug(
-                                    f"  -> Duplicate found vs existing mem {existing_idx} (Similarity: {similarity_score:.3f}, Method: {similarity_method}, Threshold: {threshold_to_use})"
-                                )
-                                logger.debug(
-                                    f"Skipping duplicate NEW memory (similarity: {similarity_score:.2f}, method: {similarity_method}): {formatted_content[:50]}..."
-                                )
-                                is_duplicate = True
-                                # Increment duplicate skipped counter for status reporting
-                                self._duplicate_skipped += 1
-                                break # Stop checking against other existing memories for this new one
+                                    
+                                if similarity_score >= threshold_to_use:
+                                    existing_id = existing_mem_dict.get("id", "unknown")
+                                    logger.debug(
+                                        f"  -> Duplicate found vs existing mem {existing_id} (Similarity: {similarity_score:.3f}, Method: {similarity_method}, Threshold: {threshold_to_use})"
+                                    )
+                                    logger.debug(
+                                        f"Skipping duplicate NEW memory (similarity: {similarity_score:.2f}, method: {similarity_method}): {formatted_content[:50]}..."
+                                    )
+                                    is_duplicate = True
+                                    # Increment duplicate skipped counter for status reporting
+                                    self._duplicate_skipped += 1
+                                    break # Stop checking against other existing memories for this new one
 
                         if not is_duplicate:
                             logger.debug(f"  -> No duplicate found. Adding to processed list: {formatted_content[:50]}...")
@@ -6775,6 +7987,35 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     f"Attempt {attempt} failed: LLM API connection error: {str(e)}"
                 )
                 self._record_circuit_breaker_failure(api_url, provider_type)
+                
+                # Run diagnostics on the final attempt to provide detailed troubleshooting info
+                if attempt > max_retries and self.valves.enable_connection_diagnostics:
+                    try:
+                        diagnostics = await self._diagnose_connection_issues(api_url, provider_type, e)
+                        tips = await self._get_connection_troubleshooting_tips(diagnostics)
+                        
+                        # Log detailed diagnostics
+                        logger.error(f"Connection diagnostics for {provider_type} at {api_url}:")
+                        logger.error(f"  Error: {diagnostics.get('error_message', 'Unknown')}")
+                        
+                        for test_name, test_result in diagnostics.get("tests", {}).items():
+                            if test_result.get("status") == "failed":
+                                logger.error(f"  {test_name}: {test_result.get('error', 'Failed')}")
+                            elif test_result.get("status") == "warnings":
+                                logger.warning(f"  {test_name}: {test_result.get('issues', [])}")
+                        
+                        if tips:
+                            logger.error("Troubleshooting suggestions:")
+                            for tip in tips:
+                                logger.error(f"  {tip}")
+                        
+                        # Return a more helpful error message with key tips
+                        if tips:
+                            key_tip = tips[0] if tips else "Check connection configuration"
+                            return f"Error: LLM_CONNECTION_FAILED - {key_tip}. See logs for full diagnostics."
+                        
+                    except Exception as diag_error:
+                        logger.warning(f"Failed to run connection diagnostics: {diag_error}")
                 
                 if attempt <= max_retries:
                     # Enhanced exponential backoff for connection errors
