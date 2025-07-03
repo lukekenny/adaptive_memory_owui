@@ -1,6 +1,34 @@
 # Completed Adaptive Memory Plugin Improvements
 
-This document tracks all completed improvements and features for the `adaptive_memory_v2.py` plugin.
+This document tracks all completed improvements and features for the adaptive memory plugin.
+
+---
+
+## Completed Tasks & Features
+
+### Task #26: Create v4.0 with Synchronous Filter Methods ✅
+
+**Date:** 2025-07-03
+**Goal:** Implement synchronous inlet(), outlet(), and stream() methods for OpenWebUI Filter Function compatibility
+**Status:** ✅ **Complete**
+
+**Implementation Details:**
+*   Created `adaptive_memory_v4.0.py` by copying from `adaptive_memory_v3.1.py`
+*   Renamed existing async methods to `async_inlet()` and `async_outlet()` to avoid conflicts
+*   Implemented synchronous wrapper methods:
+    - `inlet(self, body: dict) -> dict` - Extracts user from body["user"] and calls async_inlet
+    - `outlet(self, body: dict) -> dict` - Extracts user from body["user"] and calls async_outlet
+    - `stream(self, event: dict) -> dict` - Pass-through implementation for streaming
+*   Added proper event loop handling for sync/async compatibility
+*   Ensured all methods are error-safe (catch all exceptions, never raise)
+*   Maintained all v3.1 functionality intact
+
+**Key Requirements Met:**
+*   Methods are synchronous (not async)
+*   Extract user context from body["user"]["id"] not __user__
+*   Never raise exceptions - log errors and return body unchanged
+*   Reuse existing helper methods where possible
+*   Keep all existing v3.1 functionality intact
 
 ---
 

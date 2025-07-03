@@ -1,0 +1,71 @@
+# Task ID: 5
+# Title: Fix Memory Processing Hangs
+# Status: pending
+# Dependencies: 1, 4
+# Priority: high
+# Description: Resolve infinite 'Extracting potential new memories' state and implement proper error handling and timeouts.
+# Details:
+1. Implement asynchronous memory processing using asyncio.
+2. Add timeout handling for LLM response processing (60 seconds max).
+3. Implement proper JSON parsing error recovery using json.loads() with custom error handling.
+4. Add a task queue system using Celery for background processing.
+5. Implement progress tracking using WebSocket for real-time updates.
+6. Add cancellation option for long-running memory extractions.
+7. Implement partial results saving for interrupted processes.
+8. Use ujson for faster JSON parsing in critical sections.
+
+# Test Strategy:
+1. Unit test timeout and error recovery mechanisms.
+2. Integration test the full memory extraction pipeline.
+3. Stress test with large volumes of data and intentionally slow LLM responses.
+4. User acceptance testing for progress indication and cancellation features.
+
+# Subtasks:
+## 1. Task Decomposition and Async Processing Setup [pending]
+### Dependencies: None
+### Description: Break down the main process into smaller, independently executable subtasks suitable for asynchronous execution.
+### Details:
+Identify logical boundaries for subtasks such as LLM query, JSON parsing, error handling, and progress updates. Design async task queue and worker setup.
+
+## 2. Timeout Handling Implementation [pending]
+### Dependencies: 5.1
+### Description: Implement timeout mechanisms for each subtask to prevent indefinite hanging.
+### Details:
+Set reasonable timeouts for LLM calls and parsing operations. Ensure timeouts trigger error recovery or cancellation.
+
+## 3. Error Recovery and Malformed JSON Handling [pending]
+### Dependencies: 5.1
+### Description: Detect and recover from malformed JSON and other errors during extraction.
+### Details:
+Implement robust error handling for json_parse_error. Use tools like json_repair or validation libraries to fix or reject invalid JSON[3][1].
+
+## 4. Task Queue and Worker Setup [pending]
+### Dependencies: 5.1
+### Description: Set up a task queue and worker processes for concurrent execution.
+### Details:
+Choose and configure a task queue (e.g., Celery, Redis Queue). Define worker roles and concurrency settings.
+
+## 5. Progress Tracking and Real-time Updates [pending]
+### Dependencies: 5.1, 5.4
+### Description: Track task progress and provide real-time updates to the frontend.
+### Details:
+Implement progress tracking for each subtask. Push updates to the frontend to prevent spinner from getting stuck.
+
+## 6. Cancellation Mechanism [pending]
+### Dependencies: 5.1, 5.4
+### Description: Allow users or the system to cancel ongoing tasks.
+### Details:
+Implement cancellation signals and cleanup logic for both frontend and backend. Ensure resources are released and frontend is updated.
+
+## 7. Partial Results and Resilience [pending]
+### Dependencies: 5.1, 5.3
+### Description: Enable returning partial results in case of partial success or failure.
+### Details:
+Design system to collect and return partial results if some subtasks succeed. Ensure frontend can handle and display partial data.
+
+## 8. Optimized Parsing and Validation [pending]
+### Dependencies: 5.1, 5.3
+### Description: Optimize JSON parsing and validation for performance and reliability.
+### Details:
+Use efficient parsing libraries and schema validation (e.g., pydantic, JsonOutputParser) to ensure only valid JSON is processed[4][1]. Implement iterative validation loops if needed.
+

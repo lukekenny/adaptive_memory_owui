@@ -1,9 +1,34 @@
 # Active Context: Adaptive Memory Plugin Enhancement
 
 ### Current Focus
-Working on fixing critical memory injection issues while implementing Feature 2 (Dynamic Memory Tagging).
+Completed Task #4: Resolve LLM Connection Issues in v4.0
 
-### Latest Changes
+### Latest Changes (v4.0 - 2025-07-03)
+*   **Resolved LLM Connection Issues (Task #4)**:
+    - Implemented circuit breaker pattern for endpoint reliability
+    - Added comprehensive health check system with configurable intervals
+    - Enhanced session management with connection pooling and resource optimization
+    - Improved retry logic with exponential backoff and adaptive jitter
+    - Added connection timeout and pool size configuration
+    - Enhanced error handling and categorization for better debugging
+    - Added connection cleanup and monitoring capabilities
+*   **Created `adaptive_memory_v4.0.py`** by copying from `adaptive_memory_v3.1.py`
+*   **Implemented synchronous Filter Function methods** for OpenWebUI compatibility:
+    - `inlet(self, body: dict) -> dict` - Synchronous wrapper around async_inlet
+    - `outlet(self, body: dict) -> dict` - Synchronous wrapper around async_outlet  
+    - `stream(self, event: dict) -> dict` - Pass-through for streaming events
+*   **Renamed async methods** to `async_inlet()` and `async_outlet()` to avoid naming conflicts
+*   **Added proper event loop handling** to run async methods from sync context
+*   **Ensured error safety** - all methods catch exceptions and return unchanged data
+*   **Maintained v3.1 functionality** - all existing features preserved
+*   **Implemented User Isolation (Task #2)**:
+    - Fixed inconsistent user context handling in `_execute_memory_operation`
+    - Standardized all memory API calls to use `user_id` parameter
+    - Added comprehensive user_id validation in all critical methods
+    - Enhanced logging to include user_id for better traceability
+    - Ensured complete isolation between different users' memories
+
+### Previous v3.1 Changes
 *   Implemented Feature 2: Dynamic Memory Tagging - added support for automatic, AI-generated content tags with confidence scores
 *   Added `dynamic_tags` field to `MemoryOperation` class for storing AI-generated tags
 *   Extended `Filter.Valves` with dynamic-tagging settings, prompts, and validator functions
