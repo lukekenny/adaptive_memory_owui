@@ -3642,6 +3642,9 @@ Your output must be valid JSON only. No additional text.""",
                 if provider_type == "gemini":
                     features["supports_vision"] = True  # Most Gemini models support vision
                     features["supports_function_calling"] = True  # Gemini supports function calling
+                    features["supports_json_mode"] = True  # Gemini supports JSON mode via responseMimeType
+                    features["supports_system_messages"] = True  # Gemini supports system instructions
+                    features["supports_streaming"] = True  # Gemini supports streaming responses
                     
                 # Store detected features for this provider
                 cache_key = f"{provider_type}_{api_url}"
@@ -7729,9 +7732,12 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
 
         headers = {"Content-Type": "application/json"}
 
-        # Add API key if provided (required for OpenAI-compatible and Gemini APIs)
-        if provider_type in ["openai_compatible", "gemini"] and api_key:
+        # Add API key if provided (required for OpenAI-compatible APIs)
+        if provider_type == "openai_compatible" and api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        elif provider_type == "gemini" and api_key:
+            # Gemini API uses API key as URL parameter or x-goog-api-key header
+            headers["x-goog-api-key"] = api_key
 
         # Detect provider features for adaptive behavior (if enabled)
         provider_features = {}
@@ -7806,31 +7812,74 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         f"OpenAI-compatible request data: {json.dumps(data)[:500]}..."
                     )
                 elif provider_type == "gemini":
-                    # Prepare the request body for Gemini API (using OpenAI-compatible endpoint)
+                    # Prepare the request body for Gemini API (using correct Google Generative Language API format)
+                    # Combine system prompt with user prompt since Gemini doesn't support system role in the same way
+                    combined_prompt = f"{system_prompt_with_date}\n\nUser: {user_prompt}\n\nPlease respond in valid JSON format."
+                    
                     data = {
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": system_prompt_with_date},
-                            {"role": "user", "content": user_prompt},
+                        "contents": [
+                            {
+                                "parts": [
+                                    {"text": combined_prompt}
+                                ]
+                            }
                         ],
-                        "temperature": 0.1,  # Lower temperature for more deterministic responses
-                        "top_p": 0.95,
-                        "max_tokens": 1024,
-                        "stream": False,
+                        "generationConfig": {
+                            "temperature": 0.1,  # Lower temperature for more deterministic responses
+                            "topP": 0.95,
+                            "maxOutputTokens": 1024,
+                            "stopSequences": [],
+                            "responseMimeType": "application/json"  # Request JSON response
+                        },
+                        "safetySettings": [
+                            {
+                                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+                            },
+                            {
+                                "category": "HARM_CATEGORY_HATE_SPEECH",
+                                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+                            },
+                            {
+                                "category": "HARM_CATEGORY_HARASSMENT",
+                                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+                            },
+                            {
+                                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+                            }
+                        ]
                     }
                     
-                    # Add JSON mode if supported (should be for Gemini OpenAI-compatible endpoint)
-                    if provider_features.get("supports_json_mode", True):
-                        data["response_format"] = {"type": "json_object"}
-                        logger.debug("JSON mode enabled for Gemini API")
-                    else:
-                        logger.warning("JSON mode not supported by Gemini API, using fallback")
-                        # Fallback: Add explicit JSON instruction to prompt
-                        data["messages"][-1]["content"] += "\n\nPlease respond in valid JSON format."
+                    # Add system instruction if the model supports it
+                    if "gemini-1.5" in model.lower() or "gemini-pro" in model.lower():
+                        data["systemInstruction"] = {
+                            "parts": [
+                                {"text": system_prompt_with_date}
+                            ]
+                        }
+                        # Use only user prompt in contents when system instruction is provided
+                        data["contents"][0]["parts"][0]["text"] = f"{user_prompt}\n\nPlease respond in valid JSON format."
                     
                     logger.debug(
                         f"Gemini request data: {json.dumps(data)[:500]}..."
                     )
+                    
+                    # Update API URL to use correct Gemini endpoint format if needed
+                    if "generativelanguage.googleapis.com" not in api_url:
+                        logger.warning(f"Gemini API URL should use generativelanguage.googleapis.com, got: {api_url}")
+                        # Try to construct proper URL if it looks like a generic endpoint
+                        if "chat/completions" in api_url or "v1/completions" in api_url:
+                            # Default to gemini-pro if no model specified in URL
+                            model_for_url = model if model else "gemini-pro"
+                            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_for_url}:generateContent"
+                            logger.info(f"Updated Gemini API URL to: {api_url}")
+                    
+                    # Add API key to URL if not already present and not in headers
+                    if api_key and "key=" not in api_url and "x-goog-api-key" not in headers:
+                        api_url = f"{api_url}?key={api_key}"
+                        # Remove from headers to avoid duplication
+                        headers.pop("x-goog-api-key", None)
                 else:
                     error_msg = f"Unsupported provider type: {provider_type}"
                     logger.error(error_msg)
@@ -7893,16 +7942,41 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                     f"Retrieved content from OpenAI-compatible response (length: {len(content)})"
                                 )
                         elif provider_type == "gemini":
-                            # Gemini uses OpenAI-compatible response format
+                            # Gemini uses Google Generative Language API response format
                             if (
+                                data.get("candidates")
+                                and len(data["candidates"]) > 0
+                                and data["candidates"][0].get("content")
+                                and data["candidates"][0]["content"].get("parts")
+                                and len(data["candidates"][0]["content"]["parts"]) > 0
+                                and data["candidates"][0]["content"]["parts"][0].get("text")
+                            ):
+                                content = data["candidates"][0]["content"]["parts"][0]["text"]
+                                logger.info(
+                                    f"Retrieved content from Gemini response (length: {len(content)})"
+                                )
+                            # Fallback for older response format or error handling
+                            elif (
                                 data.get("choices")
                                 and data["choices"][0].get("message")
                                 and data["choices"][0]["message"].get("content")
                             ):
                                 content = data["choices"][0]["message"]["content"]
                                 logger.info(
-                                    f"Retrieved content from Gemini response (length: {len(content)})"
+                                    f"Retrieved content from Gemini response (fallback format, length: {len(content)})"
                                 )
+                            else:
+                                # Log the response structure for debugging
+                                logger.warning(f"Unexpected Gemini response structure: {json.dumps(data, indent=2)[:1000]}...")
+                                
+                                # Check if there's an error in the response
+                                if data.get("error"):
+                                    error_msg = f"Gemini API error: {data['error'].get('message', 'Unknown error')}"
+                                    logger.error(error_msg)
+                                    if attempt > max_retries:
+                                        return error_msg
+                                    else:
+                                        continue
                         elif provider_type == "ollama":
                             if data.get("message") and data["message"].get("content"):
                                 content = data["message"]["content"]
