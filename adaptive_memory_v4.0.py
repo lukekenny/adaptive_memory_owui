@@ -1,5 +1,5 @@
 import json
-import copy  # Add deepcopy import
+import copy
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Union, Set
@@ -10,7 +10,7 @@ import pytz
 from difflib import SequenceMatcher
 import random
 import time
-import os  # Added for local embedding model discovery
+import os
 import threading
 import uuid
 import hashlib
@@ -18,1064 +18,51 @@ import struct
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
+from pydantic import BaseModel, Field, field_validator, model_validator
+import numpy as np
+import aiohttp
+from aiohttp import ClientTimeout, TCPConnector, ClientError
 
-# ----------------------------
-# Filter Orchestration System Imports & Definitions
-# ----------------------------
+# Setup logging
+logger = logging.getLogger(__name__)
+handler = logging.StreamHandler()
+handler.setLevel(logging.INFO)
 
+# Import JSON repair system
+try:
+    from json_repair_system import EnhancedJSONParser, JSONRepairResult
+    JSON_REPAIR_AVAILABLE = True
+except ImportError:
+    logger.warning("JSON repair system not available, falling back to basic parsing")
+    JSON_REPAIR_AVAILABLE = False
+
+# Simplified Filter Orchestration System for single filter use
 class FilterPriority(Enum):
-    """Priority levels for filter execution order"""
     HIGHEST = 1
     HIGH = 2
     NORMAL = 3
     LOW = 4
     LOWEST = 5
 
-class FilterCapability(Enum):
-    """Capabilities that this filter provides"""
-    MEMORY_EXTRACTION = "memory_extraction"
-    MEMORY_INJECTION = "memory_injection"
-    CONTENT_ANALYSIS = "content_analysis"
-    USER_PROFILING = "user_profiling"
-    CONTEXT_ENHANCEMENT = "context_enhancement"
-    CONVERSATION_TRACKING = "conversation_tracking"
-
-class FilterOperation(Enum):
-    """Types of operations a filter can perform"""
-    READ_ONLY = "read_only"  # Only reads data, doesn't modify
-    CONTENT_MODIFICATION = "content_modification"  # Modifies message content
-    METADATA_ADDITION = "metadata_addition"  # Adds metadata
-    MEMORY_OPERATION = "memory_operation"  # Performs memory operations
-    CONTEXT_INJECTION = "context_injection"  # Injects context into conversation
-
-class FilterConflictType(Enum):
-    """Types of conflicts that can occur between filters"""
-    CONTENT_RACE = "content_race"  # Multiple filters modifying same content
-    MEMORY_COLLISION = "memory_collision"  # Conflicting memory operations
-    CONTEXT_OVERLAP = "context_overlap"  # Overlapping context injection
-    PERFORMANCE_IMPACT = "performance_impact"  # Combined filters causing performance issues
-
 @dataclass
 class FilterMetadata:
-    """Metadata describing filter capabilities and requirements"""
-    name: str
-    version: str
-    description: str
-    capabilities: List[FilterCapability]
-    operations: List[FilterOperation]
-    priority: FilterPriority
-    dependencies: List[str] = field(default_factory=list)
-    conflicts_with: List[str] = field(default_factory=list)
-    max_execution_time_ms: int = 5000
-    memory_requirements_mb: int = 50
-    requires_user_context: bool = True
-    modifies_content: bool = True
-    thread_safe: bool = True
+    name: str = "adaptive_memory"
+    version: str = "4.0"
+    priority: FilterPriority = FilterPriority.NORMAL
 
-@dataclass
-class FilterExecutionContext:
-    """Context for filter execution including state and coordination info"""
-    execution_id: str
-    user_id: Optional[str]
-    filter_chain: List[str] = field(default_factory=list)
-    shared_state: Dict[str, Any] = field(default_factory=dict)
-    performance_metrics: Dict[str, float] = field(default_factory=dict)
-    start_time: float = field(default_factory=time.time)
-    rollback_data: Dict[str, Any] = field(default_factory=dict)
-    conflict_warnings: List[str] = field(default_factory=list)
-
-class FilterOrchestrationManager:
-    """Manages filter coordination and execution"""
-    
+# Simplified orchestration system - most functionality moved to the main Filter class
+class SimpleOrchestrator:
     def __init__(self):
-        self._registered_filters: Dict[str, FilterMetadata] = {}
-        self._execution_contexts: Dict[str, FilterExecutionContext] = {}
-        self._performance_history: Dict[str, List[float]] = {}
-        self._conflict_detector = FilterConflictDetector()
-        self._lock = threading.RLock()
-        self._executor = None  # ThreadPoolExecutor for parallel execution
-        
-    def register_filter(self, metadata: FilterMetadata) -> bool:
-        """Register a filter with the orchestration system"""
-        try:
-            with self._lock:
-                # Check for conflicts with existing filters
-                conflicts = self._conflict_detector.detect_conflicts(metadata, list(self._registered_filters.values()))
-                if conflicts:
-                    logger.warning(f"Filter {metadata.name} has potential conflicts: {conflicts}")
-                
-                self._registered_filters[metadata.name] = metadata
-                self._performance_history[metadata.name] = []
-                logger.info(f"Registered filter: {metadata.name} v{metadata.version}")
-                return True
-        except Exception as e:
-            logger.error(f"Failed to register filter {metadata.name}: {e}")
-            return False
+        self.metadata = FilterMetadata()
+        self._performance_history = []
     
-    def create_execution_context(self, user_id: Optional[str] = None) -> FilterExecutionContext:
-        """Create a new execution context for filter coordination"""
-        context = FilterExecutionContext(
-            execution_id=str(uuid.uuid4()),
-            user_id=user_id
-        )
-        with self._lock:
-            self._execution_contexts[context.execution_id] = context
-        return context
+    def record_performance(self, execution_time_ms: float):
+        self._performance_history.append(execution_time_ms)
+        if len(self._performance_history) > 100:
+            self._performance_history.pop(0)
     
-    def record_performance(self, filter_name: str, execution_time_ms: float):
-        """Record performance metrics for a filter"""
-        with self._lock:
-            if filter_name not in self._performance_history:
-                self._performance_history[filter_name] = []
-            
-            # Keep only last 100 measurements
-            history = self._performance_history[filter_name]
-            history.append(execution_time_ms)
-            if len(history) > 100:
-                history.pop(0)
-    
-    def get_execution_order(self, filters: List[str]) -> List[str]:
-        """Determine optimal execution order based on priorities and dependencies using topological sorting"""
-        try:
-            with self._lock:
-                return self._topological_sort_with_priority(filters)
-        except Exception as e:
-            logger.error(f"Failed to determine execution order: {e}")
-            return filters  # Fallback to original order
-    
-    def _topological_sort_with_priority(self, filters: List[str]) -> List[str]:
-        """Perform topological sort considering both dependencies and priorities"""
-        # Build dependency graph
-        graph = {}
-        in_degree = {}
-        priorities = {}
-        
-        # Initialize all filters
-        for filter_name in filters:
-            graph[filter_name] = []
-            in_degree[filter_name] = 0
-            
-            if filter_name in self._registered_filters:
-                metadata = self._registered_filters[filter_name]
-                priorities[filter_name] = metadata.priority.value
-                
-                # Add dependencies
-                for dep in metadata.dependencies:
-                    if dep in filters:  # Only consider dependencies that are in the execution list
-                        graph[dep].append(filter_name)
-                        in_degree[filter_name] += 1
-            else:
-                # Unknown filters get normal priority
-                priorities[filter_name] = FilterPriority.NORMAL.value
-        
-        # Use priority queue for Kahn's algorithm with priority consideration
-        import heapq
-        # Priority queue: (priority, filter_name)
-        ready_queue = []
-        for filter_name in filters:
-            if in_degree[filter_name] == 0:
-                heapq.heappush(ready_queue, (priorities[filter_name], filter_name))
-        
-        execution_order = []
-        
-        while ready_queue:
-            _, current_filter = heapq.heappop(ready_queue)
-            execution_order.append(current_filter)
-            
-            # Process neighbors
-            for neighbor in graph[current_filter]:
-                in_degree[neighbor] -= 1
-                if in_degree[neighbor] == 0:
-                    heapq.heappush(ready_queue, (priorities[neighbor], neighbor))
-        
-        # Check for circular dependencies
-        if len(execution_order) != len(filters):
-            logger.warning("Circular dependency detected in filter chain, falling back to priority-only sorting")
-            return self._priority_only_sort(filters)
-        
-        return execution_order
-    
-    def _priority_only_sort(self, filters: List[str]) -> List[str]:
-        """Fallback sorting method using only priorities"""
-        filter_priorities = []
-        for filter_name in filters:
-            if filter_name in self._registered_filters:
-                metadata = self._registered_filters[filter_name]
-                filter_priorities.append((metadata.priority.value, filter_name))
-            else:
-                filter_priorities.append((FilterPriority.NORMAL.value, filter_name))
-        
-        filter_priorities.sort(key=lambda x: x[0])
-        return [name for _, name in filter_priorities]
-    
-    def can_execute_in_parallel(self, filter1: str, filter2: str) -> bool:
-        """Check if two filters can execute in parallel"""
-        try:
-            with self._lock:
-                if filter1 not in self._registered_filters or filter2 not in self._registered_filters:
-                    return False  # Conservative approach for unknown filters
-                
-                meta1 = self._registered_filters[filter1]
-                meta2 = self._registered_filters[filter2]
-                
-                # Check for explicit conflicts
-                if filter2 in meta1.conflicts_with or filter1 in meta2.conflicts_with:
-                    return False
-                
-                # Check for dependencies
-                if filter2 in meta1.dependencies or filter1 in meta2.dependencies:
-                    return False
-                
-                # Check for operations that can't run in parallel
-                conflicting_ops = {
-                    FilterOperation.CONTENT_MODIFICATION,
-                    FilterOperation.MEMORY_OPERATION
-                }
-                
-                if (any(op in meta1.operations for op in conflicting_ops) and
-                    any(op in meta2.operations for op in conflicting_ops)):
-                    return False
-                
-                # Check thread safety
-                if not (meta1.thread_safe and meta2.thread_safe):
-                    return False
-                
-                return True
-        except Exception as e:
-            logger.error(f"Error checking parallel execution compatibility: {e}")
-            return False
-    
-    def get_parallel_execution_groups(self, filters: List[str]) -> List[List[str]]:
-        """Group filters that can execute in parallel"""
-        try:
-            with self._lock:
-                ordered_filters = self.get_execution_order(filters)
-                groups = []
-                
-                while ordered_filters:
-                    # Start a new group with the next filter
-                    current_group = [ordered_filters.pop(0)]
-                    
-                    # Try to add more filters that can run in parallel with all filters in current group
-                    i = 0
-                    while i < len(ordered_filters):
-                        filter_name = ordered_filters[i]
-                        can_add = True
-                        
-                        # Check if this filter can run in parallel with all filters in current group
-                        for group_filter in current_group:
-                            if not self.can_execute_in_parallel(group_filter, filter_name):
-                                can_add = False
-                                break
-                        
-                        if can_add:
-                            current_group.append(ordered_filters.pop(i))
-                        else:
-                            i += 1
-                    
-                    groups.append(current_group)
-                
-                return groups
-        except Exception as e:
-            logger.error(f"Error grouping filters for parallel execution: {e}")
-            return [[f] for f in filters]  # Fallback to sequential execution
-    
-    def initialize_executor(self, max_workers: int = 5):
-        """Initialize ThreadPoolExecutor for parallel filter execution"""
-        try:
-            from concurrent.futures import ThreadPoolExecutor
-            if self._executor is None:
-                self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="filter-exec")
-                logger.info(f"Initialized filter orchestration executor with {max_workers} workers")
-        except Exception as e:
-            logger.error(f"Failed to initialize executor: {e}")
-    
-    def orchestrate_filter_chain(self, filters: List[str], operation: str, context: Optional[FilterExecutionContext] = None, **kwargs):
-        """Main orchestrator method to manage complete filter chain execution"""
-        try:
-            if not filters:
-                return []
-            
-            with self._lock:
-                # Initialize executor if needed
-                if self._executor is None:
-                    max_workers = kwargs.get('max_concurrent_filters', 5)
-                    self.initialize_executor(max_workers)
-                
-                # Get optimal execution groups (handles dependencies and parallel execution)
-                execution_groups = self.get_parallel_execution_groups(filters)
-                
-                # Track operation in context
-                if context:
-                    context.filter_chain.extend(filters)
-                    context.shared_state['orchestration_groups'] = len(execution_groups)
-                
-                logger.debug(f"Orchestrating {len(filters)} filters in {len(execution_groups)} execution groups")
-                
-                # Execute filter groups with coordination
-                results = self._execute_coordinated_filter_chain(execution_groups, operation, context, **kwargs)
-                
-                # Record orchestration performance
-                if context:
-                    orchestration_time = time.time() - context.start_time
-                    context.performance_metrics['orchestration_total_time_ms'] = orchestration_time * 1000
-                
-                return results
-                
-        except Exception as e:
-            logger.error(f"Filter orchestration failed: {e}")
-            if context:
-                context.conflict_warnings.append(f"Orchestration error: {str(e)}")
-            return []
-    
-    def _execute_coordinated_filter_chain(self, execution_groups: List[List[str]], operation: str, context: Optional[FilterExecutionContext], **kwargs):
-        """Execute filter groups with coordination and lifecycle management"""
-        all_results = []
-        
-        try:
-            for group_index, group in enumerate(execution_groups):
-                group_start_time = time.time()
-                
-                # Log group execution start
-                logger.debug(f"Executing filter group {group_index + 1}/{len(execution_groups)}: {group}")
-                
-                if len(group) == 1:
-                    # Single filter execution with lifecycle management
-                    filter_name = group[0]
-                    result = self._execute_single_filter_with_lifecycle(filter_name, operation, context, **kwargs)
-                    all_results.append(result)
-                else:
-                    # Parallel group execution
-                    group_results = self._execute_parallel_group_with_coordination(group, operation, context, **kwargs)
-                    all_results.extend(group_results)
-                
-                # Record group performance
-                group_time = (time.time() - group_start_time) * 1000
-                if context:
-                    context.performance_metrics[f'group_{group_index}_execution_time_ms'] = group_time
-                
-                logger.debug(f"Completed filter group {group_index + 1} in {group_time:.2f}ms")
-                
-        except Exception as e:
-            logger.error(f"Error in coordinated filter chain execution: {e}")
-            if context:
-                context.conflict_warnings.append(f"Chain execution error: {str(e)}")
-        
-        return all_results
-    
-    def _execute_single_filter_with_lifecycle(self, filter_name: str, operation: str, context: Optional[FilterExecutionContext], **kwargs):
-        """Execute a single filter with complete lifecycle management"""
-        start_time = time.time()
-        
-        try:
-            # Pre-execution phase
-            self._pre_filter_execution(filter_name, operation, context)
-            
-            # Get filter metadata for execution parameters
-            metadata = self._registered_filters.get(filter_name)
-            if metadata:
-                timeout = metadata.max_execution_time_ms / 1000.0
-            else:
-                timeout = 10.0  # Default timeout
-            
-            # Execute filter (this would be where actual filter execution happens)
-            # For now, this is a placeholder - actual implementation would call the filter
-            result = self._call_filter_method(filter_name, operation, context, timeout, **kwargs)
-            
-            # Post-execution phase
-            execution_time = time.time() - start_time
-            self._post_filter_execution(filter_name, operation, context, execution_time, success=True)
-            
-            return (filter_name, result, None)
-            
-        except Exception as e:
-            execution_time = time.time() - start_time
-            self._post_filter_execution(filter_name, operation, context, execution_time, success=False, error=str(e))
-            return (filter_name, None, str(e))
-    
-    def _execute_parallel_group_with_coordination(self, group: List[str], operation: str, context: Optional[FilterExecutionContext], **kwargs):
-        """Execute a group of filters in parallel with coordination"""
-        try:
-            from concurrent.futures import as_completed, TimeoutError as FutureTimeoutError
-            
-            # Submit all filters in the group
-            group_futures = {}
-            for filter_name in group:
-                future = self._executor.submit(
-                    self._execute_single_filter_with_lifecycle, 
-                    filter_name, operation, context, **kwargs
-                )
-                group_futures[future] = filter_name
-            
-            # Collect results with timeout
-            group_results = []
-            timeout = kwargs.get('group_timeout', 30.0)
-            
-            for future in as_completed(group_futures, timeout=timeout):
-                try:
-                    result = future.result()
-                    group_results.append(result)
-                except Exception as e:
-                    filter_name = group_futures[future]
-                    logger.error(f"Parallel filter {filter_name} failed: {e}")
-                    group_results.append((filter_name, None, str(e)))
-            
-            return group_results
-            
-        except FutureTimeoutError:
-            logger.error(f"Parallel group execution timed out after {timeout}s")
-            # Cancel remaining futures
-            for future in group_futures:
-                if not future.done():
-                    future.cancel()
-            return [(name, None, "Execution timeout") for name in group]
-        except Exception as e:
-            logger.error(f"Error in parallel group execution: {e}")
-            return [(name, None, str(e)) for name in group]
-    
-    def _pre_filter_execution(self, filter_name: str, operation: str, context: Optional[FilterExecutionContext]):
-        """Pre-execution lifecycle phase"""
-        try:
-            if context:
-                context.shared_state[f'{filter_name}_start_time'] = time.time()
-                
-            # Check for any last-minute conflicts
-            if filter_name in self._registered_filters:
-                metadata = self._registered_filters[filter_name]
-                other_filters = [name for name in context.filter_chain if name != filter_name] if context else []
-                
-                for other_name in other_filters:
-                    if other_name in self._registered_filters:
-                        other_metadata = self._registered_filters[other_name]
-                        conflicts = self._conflict_detector.detect_conflicts(metadata, [other_metadata])
-                        if conflicts and context:
-                            context.conflict_warnings.extend([f"{filter_name}: {c}" for c in conflicts])
-            
-            logger.debug(f"Pre-execution setup completed for {filter_name}")
-            
-        except Exception as e:
-            logger.warning(f"Pre-execution setup failed for {filter_name}: {e}")
-    
-    def _post_filter_execution(self, filter_name: str, operation: str, context: Optional[FilterExecutionContext], 
-                              execution_time: float, success: bool, error: str = None):
-        """Post-execution lifecycle phase"""
-        try:
-            # Record performance
-            execution_time_ms = execution_time * 1000
-            self.record_performance(filter_name, execution_time_ms)
-            
-            if context:
-                context.performance_metrics[f'{filter_name}_execution_time_ms'] = execution_time_ms
-                context.shared_state[f'{filter_name}_completed'] = success
-                context.shared_state[f'{filter_name}_end_time'] = time.time()
-                
-                if not success and error:
-                    context.conflict_warnings.append(f"{filter_name} execution failed: {error}")
-            
-            # Log completion
-            status = "successfully" if success else f"with error: {error}"
-            logger.debug(f"Filter {filter_name} completed {status} in {execution_time_ms:.2f}ms")
-            
-        except Exception as e:
-            logger.warning(f"Post-execution cleanup failed for {filter_name}: {e}")
-    
-    def _call_filter_method(self, filter_name: str, operation: str, context: Optional[FilterExecutionContext], timeout: float, **kwargs):
-        """Placeholder for actual filter method calls - to be implemented by specific filter systems"""
-        # This is where the actual filter execution would happen
-        # For now, return a placeholder result
-        import time
-        time.sleep(0.01)  # Simulate some processing time
-        return f"Result from {filter_name} for {operation}"
-    
-    def shutdown_executor(self, wait: bool = True):
-        """Shutdown the ThreadPoolExecutor"""
-        try:
-            if self._executor is not None:
-                self._executor.shutdown(wait=wait)
-                self._executor = None
-                logger.info("Filter orchestration executor shut down")
-        except Exception as e:
-            logger.error(f"Failed to shutdown executor: {e}")
-    
-    def create_orchestration_checkpoint(self, context: FilterExecutionContext, operation: str, checkpoint_data: Dict[str, Any]) -> str:
-        """Create a checkpoint for orchestration-level rollback"""
-        try:
-            checkpoint_id = str(uuid.uuid4())
-            checkpoint = {
-                "checkpoint_id": checkpoint_id,
-                "execution_id": context.execution_id,
-                "operation": operation,
-                "timestamp": time.time(),
-                "filter_states": {},
-                "shared_state_snapshot": copy.deepcopy(context.shared_state),
-                "performance_snapshot": copy.deepcopy(context.performance_metrics),
-                "checkpoint_data": copy.deepcopy(checkpoint_data)
-            }
-            
-            # Store in context rollback data
-            if 'orchestration_checkpoints' not in context.rollback_data:
-                context.rollback_data['orchestration_checkpoints'] = []
-            
-            context.rollback_data['orchestration_checkpoints'].append(checkpoint)
-            
-            # Keep only last 5 checkpoints per context
-            if len(context.rollback_data['orchestration_checkpoints']) > 5:
-                context.rollback_data['orchestration_checkpoints'].pop(0)
-            
-            logger.debug(f"Created orchestration checkpoint {checkpoint_id} for operation {operation}")
-            return checkpoint_id
-            
-        except Exception as e:
-            logger.error(f"Failed to create orchestration checkpoint: {e}")
-            return ""
-    
-    def rollback_to_checkpoint(self, context: FilterExecutionContext, checkpoint_id: str = None) -> bool:
-        """Rollback orchestration to a specific checkpoint"""
-        try:
-            if 'orchestration_checkpoints' not in context.rollback_data:
-                logger.warning("No orchestration checkpoints available for rollback")
-                return False
-            
-            checkpoints = context.rollback_data['orchestration_checkpoints']
-            if not checkpoints:
-                logger.warning("No checkpoints found in context")
-                return False
-            
-            # Find the checkpoint
-            target_checkpoint = None
-            if checkpoint_id:
-                for checkpoint in reversed(checkpoints):
-                    if checkpoint['checkpoint_id'] == checkpoint_id:
-                        target_checkpoint = checkpoint
-                        break
-            else:
-                # Use most recent checkpoint
-                target_checkpoint = checkpoints[-1]
-            
-            if not target_checkpoint:
-                logger.warning(f"Checkpoint not found: {checkpoint_id}")
-                return False
-            
-            # Restore context state
-            context.shared_state.clear()
-            context.shared_state.update(target_checkpoint['shared_state_snapshot'])
-            
-            context.performance_metrics.clear()
-            context.performance_metrics.update(target_checkpoint['performance_snapshot'])
-            
-            # Add rollback warning
-            rollback_time = time.time()
-            context.conflict_warnings.append(
-                f"Orchestration rollback performed at {rollback_time} to checkpoint {target_checkpoint['checkpoint_id']}"
-            )
-            
-            logger.info(f"Successfully rolled back to checkpoint {target_checkpoint['checkpoint_id']}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to rollback to checkpoint: {e}")
-            return False
-    
-    def handle_filter_failure(self, context: FilterExecutionContext, failed_filter: str, error: str, auto_rollback: bool = True) -> bool:
-        """Handle filter failure with orchestration-level response"""
-        try:
-            # Record the failure
-            if context:
-                context.conflict_warnings.append(f"Filter {failed_filter} failed: {error}")
-                context.shared_state[f'{failed_filter}_failed'] = True
-                context.shared_state[f'{failed_filter}_error'] = error
-            
-            # Attempt automatic rollback if enabled
-            if auto_rollback and context:
-                logger.warning(f"Filter {failed_filter} failed, attempting orchestration rollback")
-                
-                # Try to rollback to last checkpoint
-                rollback_success = self.rollback_to_checkpoint(context)
-                
-                if rollback_success:
-                    logger.info(f"Successfully recovered from {failed_filter} failure via rollback")
-                    return True
-                else:
-                    logger.error(f"Failed to rollback after {failed_filter} failure")
-            
-            # Notify other filters in the chain about the failure
-            if context:
-                context.shared_state['chain_failure'] = {
-                    'failed_filter': failed_filter,
-                    'error': error,
-                    'timestamp': time.time()
-                }
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Error handling filter failure: {e}")
-            return False
-    
-    def validate_orchestration_state(self, context: FilterExecutionContext) -> Dict[str, Any]:
-        """Validate the current orchestration state and detect inconsistencies"""
-        validation_result = {
-            "valid": True,
-            "warnings": [],
-            "errors": [],
-            "recommendations": []
-        }
-        
-        try:
-            # Check execution context integrity
-            if not context.execution_id:
-                validation_result["errors"].append("Missing execution ID")
-                validation_result["valid"] = False
-            
-            # Check for conflicting filter states
-            completed_filters = [key.replace('_completed', '') for key in context.shared_state.keys() if key.endswith('_completed')]
-            failed_filters = [key.replace('_failed', '') for key in context.shared_state.keys() if key.endswith('_failed')]
-            
-            overlap = set(completed_filters) & set(failed_filters)
-            if overlap:
-                validation_result["warnings"].append(f"Filters marked both completed and failed: {list(overlap)}")
-            
-            # Check performance metrics consistency
-            execution_times = {key: value for key, value in context.performance_metrics.items() if key.endswith('_execution_time_ms')}
-            if execution_times:
-                avg_time = sum(execution_times.values()) / len(execution_times)
-                slow_filters = [key for key, time in execution_times.items() if time > avg_time * 3]
-                if slow_filters:
-                    validation_result["warnings"].append(f"Unusually slow filters detected: {slow_filters}")
-            
-            # Check for rollback opportunities
-            if len(context.conflict_warnings) > 5:
-                validation_result["recommendations"].append("Consider creating additional checkpoints due to high conflict count")
-            
-            # Check filter chain completeness
-            expected_filters = context.filter_chain
-            completed_count = len([f for f in expected_filters if context.shared_state.get(f'{f}_completed', False)])
-            completion_ratio = completed_count / len(expected_filters) if expected_filters else 0
-            
-            if completion_ratio < 0.5:
-                validation_result["warnings"].append(f"Low filter completion ratio: {completion_ratio:.2%}")
-            
-            return validation_result
-            
-        except Exception as e:
-            validation_result["errors"].append(f"Validation error: {str(e)}")
-            validation_result["valid"] = False
-            return validation_result
-    
-    def execute_filters_parallel(self, filter_groups: List[List[str]], filter_executor_func, *args, **kwargs):
-        """Execute filter groups in parallel"""
-        try:
-            if self._executor is None:
-                self.initialize_executor()
-            
-            from concurrent.futures import as_completed
-            import time
-            
-            all_results = []
-            
-            for group in filter_groups:
-                if len(group) == 1:
-                    # Single filter - execute directly
-                    try:
-                        result = filter_executor_func(group[0], *args, **kwargs)
-                        all_results.append((group[0], result, None))
-                    except Exception as e:
-                        all_results.append((group[0], None, str(e)))
-                else:
-                    # Multiple filters - execute in parallel
-                    group_futures = {}
-                    for filter_name in group:
-                        future = self._executor.submit(filter_executor_func, filter_name, *args, **kwargs)
-                        group_futures[future] = filter_name
-                    
-                    # Wait for all futures in this group to complete
-                    for future in as_completed(group_futures, timeout=30):  # 30 second timeout per group
-                        filter_name = group_futures[future]
-                        try:
-                            result = future.result()
-                            all_results.append((filter_name, result, None))
-                        except Exception as e:
-                            all_results.append((filter_name, None, str(e)))
-                            logger.error(f"Filter {filter_name} execution failed: {e}")
-            
-            return all_results
-            
-        except Exception as e:
-            logger.error(f"Error in parallel filter execution: {e}")
-            # Fallback to sequential execution
-            results = []
-            for group in filter_groups:
-                for filter_name in group:
-                    try:
-                        result = filter_executor_func(filter_name, *args, **kwargs)
-                        results.append((filter_name, result, None))
-                    except Exception as e:
-                        results.append((filter_name, None, str(e)))
-            return results
-
-class FilterConflictDetector:
-    """Detects potential conflicts between filters"""
-    
-    def detect_conflicts(self, new_filter: FilterMetadata, existing_filters: List[FilterMetadata]) -> List[str]:
-        """Detect potential conflicts with existing filters"""
-        conflicts = []
-        
-        for existing in existing_filters:
-            conflicts.extend(self._check_explicit_conflicts(new_filter, existing))
-            conflicts.extend(self._check_operation_conflicts(new_filter, existing))
-            conflicts.extend(self._check_capability_conflicts(new_filter, existing))
-            conflicts.extend(self._check_performance_conflicts(new_filter, existing))
-            conflicts.extend(self._check_resource_conflicts(new_filter, existing))
-        
-        return conflicts
-    
-    def _check_explicit_conflicts(self, filter1: FilterMetadata, filter2: FilterMetadata) -> List[str]:
-        """Check for explicitly declared conflicts"""
-        conflicts = []
-        if filter2.name in filter1.conflicts_with or filter1.name in filter2.conflicts_with:
-            conflicts.append(f"Explicit conflict with {filter2.name}")
-        return conflicts
-    
-    def _check_operation_conflicts(self, filter1: FilterMetadata, filter2: FilterMetadata) -> List[str]:
-        """Check for operation-level conflicts"""
-        conflicts = []
-        
-        # Content modification races
-        if (FilterOperation.CONTENT_MODIFICATION in filter1.operations and
-            FilterOperation.CONTENT_MODIFICATION in filter2.operations):
-            conflicts.append(f"Content modification race with {filter2.name}")
-        
-        # Memory operation conflicts
-        if (FilterOperation.MEMORY_OPERATION in filter1.operations and
-            FilterOperation.MEMORY_OPERATION in filter2.operations):
-            conflicts.append(f"Memory operation conflict with {filter2.name}")
-        
-        # Context injection conflicts
-        if (FilterOperation.CONTEXT_INJECTION in filter1.operations and
-            FilterOperation.CONTEXT_INJECTION in filter2.operations):
-            conflicts.append(f"Context injection conflict with {filter2.name}")
-        
-        return conflicts
-    
-    def _check_capability_conflicts(self, filter1: FilterMetadata, filter2: FilterMetadata) -> List[str]:
-        """Check for capability-level conflicts"""
-        conflicts = []
-        
-        # Memory extraction overlap
-        if (FilterCapability.MEMORY_EXTRACTION in filter1.capabilities and
-            FilterCapability.MEMORY_EXTRACTION in filter2.capabilities):
-            conflicts.append(f"Memory extraction overlap with {filter2.name}")
-        
-        # Context enhancement conflicts
-        if (FilterCapability.CONTEXT_ENHANCEMENT in filter1.capabilities and
-            FilterCapability.CONTEXT_ENHANCEMENT in filter2.capabilities):
-            conflicts.append(f"Context enhancement overlap with {filter2.name}")
-        
-        # User profiling conflicts
-        if (FilterCapability.USER_PROFILING in filter1.capabilities and
-            FilterCapability.USER_PROFILING in filter2.capabilities):
-            conflicts.append(f"User profiling overlap with {filter2.name}")
-        
-        return conflicts
-    
-    def _check_performance_conflicts(self, filter1: FilterMetadata, filter2: FilterMetadata) -> List[str]:
-        """Check for performance-related conflicts"""
-        conflicts = []
-        
-        # Combined execution time might be too high
-        combined_time = filter1.max_execution_time_ms + filter2.max_execution_time_ms
-        if combined_time > 15000:  # 15 second threshold
-            conflicts.append(f"Combined execution time too high with {filter2.name} ({combined_time}ms)")
-        
-        # Combined memory usage might be too high
-        combined_memory = filter1.memory_requirements_mb + filter2.memory_requirements_mb
-        if combined_memory > 500:  # 500MB threshold
-            conflicts.append(f"Combined memory usage too high with {filter2.name} ({combined_memory}MB)")
-        
-        return conflicts
-    
-    def _check_resource_conflicts(self, filter1: FilterMetadata, filter2: FilterMetadata) -> List[str]:
-        """Check for resource-related conflicts"""
-        conflicts = []
-        
-        # Thread safety conflicts
-        if not filter1.thread_safe or not filter2.thread_safe:
-            conflicts.append(f"Thread safety conflict with {filter2.name}")
-        
-        # User context conflicts (if both require exclusive user context)
-        if (filter1.requires_user_context and filter2.requires_user_context and
-            filter1.modifies_content and filter2.modifies_content):
-            conflicts.append(f"User context exclusivity conflict with {filter2.name}")
-        
-        return conflicts
-    
-    def resolve_conflicts(self, conflicts: List[str], filter1: FilterMetadata, filter2: FilterMetadata) -> Dict[str, str]:
-        """Suggest conflict resolution strategies"""
-        resolutions = {}
-        
-        for conflict in conflicts:
-            if "Content modification race" in conflict:
-                resolutions[conflict] = "Execute filters sequentially or use content locking"
-            elif "Memory operation conflict" in conflict:
-                resolutions[conflict] = "Coordinate memory operations or use separate memory spaces"
-            elif "execution time too high" in conflict:
-                resolutions[conflict] = "Execute filters in parallel or increase timeout limits"
-            elif "memory usage too high" in conflict:
-                resolutions[conflict] = "Execute filters sequentially or increase memory limits"
-            elif "Thread safety conflict" in conflict:
-                resolutions[conflict] = "Execute filters sequentially with thread locks"
-            else:
-                resolutions[conflict] = "Consider filter priority adjustment or sequential execution"
-        
-        return resolutions
-
-class FilterPluginManager:
-    """Manages dynamic filter plugin discovery and registration"""
-    
-    def __init__(self, orchestration_manager: FilterOrchestrationManager):
-        self._orchestration_manager = orchestration_manager
-        self._plugin_registry: Dict[str, Any] = {}
-        self._plugin_metadata: Dict[str, FilterMetadata] = {}
-        
-    def discover_plugins(self, plugin_paths: List[str] = None) -> List[str]:
-        """Discover filter plugins from specified paths or default locations"""
-        discovered = []
-        
-        # Default plugin discovery paths
-        if plugin_paths is None:
-            plugin_paths = [
-                "filters/",
-                "plugins/filters/",
-                os.path.expanduser("~/.openwebui/filters/"),
-                "/opt/openwebui/filters/"
-            ]
-        
-        for path in plugin_paths:
-            if os.path.exists(path):
-                discovered.extend(self._scan_directory_for_filters(path))
-        
-        # Try setuptools entry points for installed packages
-        try:
-            discovered.extend(self._discover_entry_point_filters())
-        except Exception as e:
-            logger.debug(f"Entry point discovery failed: {e}")
-        
-        return discovered
-    
-    def _scan_directory_for_filters(self, directory: str) -> List[str]:
-        """Scan directory for filter Python files"""
-        filters = []
-        try:
-            for filename in os.listdir(directory):
-                if filename.endswith('.py') and not filename.startswith('__'):
-                    filter_path = os.path.join(directory, filename)
-                    filter_name = filename[:-3]  # Remove .py extension
-                    
-                    # Basic validation that it's a filter
-                    if self._validate_filter_file(filter_path):
-                        filters.append(filter_name)
-                        
-        except Exception as e:
-            logger.debug(f"Error scanning directory {directory}: {e}")
-        
-        return filters
-    
-    def _discover_entry_point_filters(self) -> List[str]:
-        """Discover filters through setuptools entry points"""
-        filters = []
-        try:
-            # This would typically use pkg_resources or importlib.metadata
-            # For now, just a placeholder implementation
-            pass
-        except Exception as e:
-            logger.debug(f"Entry point discovery error: {e}")
-        
-        return filters
-    
-    def _validate_filter_file(self, file_path: str) -> bool:
-        """Basic validation that a Python file contains a filter"""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-                
-            # Look for filter-like patterns
-            filter_indicators = [
-                'class Filter(',
-                'def inlet(',
-                'def outlet(',
-                'FilterMetadata',
-                'OpenWebUI'
-            ]
-            
-            return any(indicator in content for indicator in filter_indicators)
-            
-        except Exception:
-            return False
-    
-    def load_plugin(self, plugin_name: str, plugin_path: str = None) -> bool:
-        """Load a filter plugin and register it with orchestration"""
-        try:
-            # Dynamic import of the plugin
-            if plugin_path:
-                import importlib.util
-                spec = importlib.util.spec_from_file_location(plugin_name, plugin_path)
-                plugin_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(plugin_module)
-            else:
-                import importlib
-                plugin_module = importlib.import_module(plugin_name)
-            
-            # Extract filter metadata
-            metadata = self._extract_plugin_metadata(plugin_module, plugin_name)
-            if metadata:
-                # Register with orchestration system
-                success = self._orchestration_manager.register_filter(metadata)
-                if success:
-                    self._plugin_registry[plugin_name] = plugin_module
-                    self._plugin_metadata[plugin_name] = metadata
-                    logger.info(f"Successfully loaded plugin: {plugin_name}")
-                    return True
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Failed to load plugin {plugin_name}: {e}")
-            return False
-    
-    def unload_plugin(self, plugin_name: str) -> bool:
-        """Unload a filter plugin"""
-        try:
-            if plugin_name in self._plugin_registry:
-                # Remove from orchestration manager
-                if hasattr(self._orchestration_manager, '_registered_filters'):
-                    self._orchestration_manager._registered_filters.pop(plugin_name, None)
-                
-                # Remove from plugin registry
-                self._plugin_registry.pop(plugin_name, None)
-                self._plugin_metadata.pop(plugin_name, None)
-                
-                logger.info(f"Successfully unloaded plugin: {plugin_name}")
-                return True
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Failed to unload plugin {plugin_name}: {e}")
-            return False
-    
-    def _extract_plugin_metadata(self, plugin_module, plugin_name: str) -> Optional[FilterMetadata]:
-        """Extract FilterMetadata from a plugin module"""
-        try:
-            # Look for explicit metadata
-            if hasattr(plugin_module, 'FILTER_METADATA'):
-                return plugin_module.FILTER_METADATA
-            
-            # Look for Filter class with metadata
-            if hasattr(plugin_module, 'Filter'):
-                filter_class = plugin_module.Filter
-                if hasattr(filter_class, 'get_filter_metadata'):
-                    return filter_class.get_filter_metadata()
-            
-            # Create basic metadata from class inspection
-            metadata = FilterMetadata(
-                name=plugin_name,
-                version="1.0.0",
-                description=f"External filter plugin: {plugin_name}",
-                capabilities=[FilterCapability.CONTENT_ANALYSIS],  # Default capability
-                operations=[FilterOperation.READ_ONLY],  # Conservative default
-                priority=FilterPriority.NORMAL,
-                thread_safe=True  # Assume thread safe unless specified
-            )
-            
-            return metadata
-            
-        except Exception as e:
-            logger.error(f"Failed to extract metadata from plugin {plugin_name}: {e}")
-            return None
-    
-    def get_loaded_plugins(self) -> Dict[str, FilterMetadata]:
-        """Get list of currently loaded plugins"""
-        return self._plugin_metadata.copy()
-    
-    def reload_plugin(self, plugin_name: str) -> bool:
-        """Reload a plugin (useful during development)"""
-        if plugin_name in self._plugin_registry:
-            # Get the module path before unloading
-            plugin_module = self._plugin_registry[plugin_name]
-            plugin_path = getattr(plugin_module, '__file__', None)
-            
-            # Unload and reload
-            if self.unload_plugin(plugin_name):
-                return self.load_plugin(plugin_name, plugin_path)
-        
-        return False
-
-# Global orchestration manager instance
-_orchestration_manager = FilterOrchestrationManager()
-
-# Global plugin manager instance
-_plugin_manager = FilterPluginManager(_orchestration_manager)
-
-# ----------------------------
-# Metrics & Monitoring Imports
-# ----------------------------
-try:
-    from prometheus_client import Counter, Histogram, REGISTRY, generate_latest  # type: ignore
-except ImportError:
-    # Fallback: define dummy Counter/Histogram if prometheus_client not installed
-    class _NoOpMetric:
-        def __init__(self, *args, **kwargs):
-            pass
-        def labels(self, *args, **kwargs):
-            return self
-        def inc(self, *args, **kwargs):
-            pass
-        def observe(self, *args, **kwargs):
-            pass
-
-    Counter = Histogram = _NoOpMetric
-
-# Define Prometheus metrics (or no-op if client missing)
-EMBEDDING_REQUESTS = Counter('adaptive_memory_embedding_requests_total', 'Total number of embedding requests', ['provider'])
-EMBEDDING_ERRORS = Counter('adaptive_memory_embedding_errors_total', 'Total number of embedding errors', ['provider'])
-EMBEDDING_LATENCY = Histogram('adaptive_memory_embedding_latency_seconds', 'Latency of embedding generation', ['provider'])
-
-RETRIEVAL_REQUESTS = Counter('adaptive_memory_retrieval_requests_total', 'Total number of get_relevant_memories calls', [])
-RETRIEVAL_ERRORS = Counter('adaptive_memory_retrieval_errors_total', 'Total number of retrieval errors', [])
-RETRIEVAL_LATENCY = Histogram('adaptive_memory_retrieval_latency_seconds', 'Latency of get_relevant_memories execution', [])
-
-# Filter orchestration metrics
-FILTER_EXECUTIONS = Counter('adaptive_memory_filter_executions_total', 'Total number of filter executions', ['operation', 'status'])
-FILTER_LATENCY = Histogram('adaptive_memory_filter_latency_seconds', 'Latency of filter operations', ['operation'])
-FILTER_CONFLICTS = Counter('adaptive_memory_filter_conflicts_total', 'Total number of filter conflicts detected', ['conflict_type'])
-FILTER_ROLLBACKS = Counter('adaptive_memory_filter_rollbacks_total', 'Total number of filter rollbacks', ['reason'])
-COORDINATION_OVERHEAD = Histogram('adaptive_memory_coordination_overhead_seconds', 'Overhead from filter coordination', [])
-
-# Embedding model imports
-from sentence_transformers import SentenceTransformer
-import numpy as np
-
-import aiohttp
-from aiohttp import ClientError, ClientTimeout, TCPConnector
-from fastapi import Response
-from pydantic import BaseModel, Field, model_validator, field_validator, validator
-
-# Updated imports for OpenWebUI 0.5+
-from open_webui.routers.memories import (
-    add_memory,
-    AddMemoryForm,
-    query_memory,
-    QueryMemoryForm,
-    delete_memory_by_id,
-    Memories,
-)
-from open_webui.models.users import Users
-from open_webui.main import app as webui_app
-
-# Set up logging
-logger = logging.getLogger("openwebui.plugins.adaptive_memory")
-handler = logging.StreamHandler()
-
+    def get_average_performance(self) -> float:
+        return sum(self._performance_history) / len(self._performance_history) if self._performance_history else 0.0
 
 class JsonFormatter(logging.Formatter):
     def format(self, record):
@@ -1116,81 +103,7 @@ class MemoryOperation(BaseModel):
 
 
 class Filter:
-    """
-    Adaptive Memory Filter v4.0 with Filter Orchestration System
-    
-    This filter provides persistent, personalized memory capabilities for Large Language Models
-    with dynamic extraction, filtering, storage, and retrieval of user-specific information.
-    
-    NEW in v4.0: Filter Orchestration System
-    ========================================
-    
-    The Filter Orchestration System enables this filter to work harmoniously with other
-    filters in OpenWebUI by providing:
-    
-    1. **Filter Metadata Declaration**: Declares capabilities, operations, and requirements
-    2. **Conflict Detection**: Automatically detects potential conflicts with other filters
-    3. **Performance Monitoring**: Tracks execution times and coordination overhead
-    4. **Priority Management**: Supports execution order based on filter priorities
-    5. **Rollback Mechanism**: Provides rollback capabilities for failed operations
-    6. **State Management**: Thread-safe operations with proper isolation levels
-    7. **Coordination APIs**: RESTful endpoints for orchestration status and control
-    
-    Filter Capabilities:
-    - Memory Extraction: Identifies and extracts key information from conversations
-    - Memory Injection: Injects relevant memories into conversation context
-    - Content Analysis: Analyzes message content for memory-worthy information
-    - User Profiling: Builds user profiles based on extracted memories
-    - Context Enhancement: Enhances conversation context with relevant history
-    - Conversation Tracking: Tracks conversation flow and user preferences
-    
-    Filter Operations:
-    - Content Modification: Modifies message content to inject memories
-    - Metadata Addition: Adds metadata to messages and memories
-    - Memory Operations: Creates, updates, and deletes memories
-    - Context Injection: Injects contextual information into conversations
-    
-    Orchestration Configuration:
-    - enable_filter_orchestration: Enable/disable orchestration features
-    - filter_priority: Set execution priority (highest, high, normal, low, lowest)
-    - enable_conflict_detection: Enable automatic conflict detection
-    - enable_performance_monitoring: Track performance metrics
-    - enable_rollback_mechanism: Enable operation rollback capabilities
-    - filter_isolation_level: Set isolation level (none, partial, full)
-    
-    API Endpoints:
-    - GET /adaptive-memory/orchestration/metadata: Get filter metadata
-    - GET /adaptive-memory/orchestration/status: Get orchestration status
-    - GET /adaptive-memory/orchestration/conflicts: Get conflict report
-    - GET /adaptive-memory/orchestration/metrics: Get Prometheus metrics
-    - POST /adaptive-memory/orchestration/rollback: Trigger rollback operation
-    
-    Thread Safety:
-    This filter is designed to be thread-safe and can run concurrently with other
-    filters when proper isolation levels are configured.
-    
-    Performance Considerations:
-    - Coordination overhead is monitored and alerts are generated if thresholds are exceeded
-    - Performance metrics are collected for optimization
-    - Circuit breaker patterns prevent cascade failures
-    
-    Example Usage:
-    ```python
-    # Enable orchestration with high priority
-    filter_instance.valves.enable_filter_orchestration = True
-    filter_instance.valves.filter_priority = "high"
-    filter_instance.valves.enable_conflict_detection = True
-    
-    # Get orchestration status
-    status = filter_instance.get_orchestration_status()
-    
-    # Get conflict report
-    conflicts = filter_instance.get_conflict_report()
-    ```
-    """
-    
-    # Class-level singleton attributes to avoid missing attribute errors
-    _embedding_model = None # Keep the underlying attribute name
+    _embedding_model = None
     _memory_embeddings = {}
     _relevance_cache = {}
 
@@ -1201,7 +114,6 @@ class Filter:
                 from sentence_transformers import SentenceTransformer
                 # Use the model name from valves for local loading too
                 local_model_name = self.valves.embedding_model_name if self.valves.embedding_provider_type == 'local' else 'all-MiniLM-L6-v2'
-                logger.info(f"Loading local embedding model: {local_model_name}")
                 self._embedding_model = SentenceTransformer(local_model_name)
             except Exception as e:
                 logger.error(f"Failed to load local SentenceTransformer model: {e}")
@@ -1222,29 +134,20 @@ class Filter:
             if self._embedding_model is not None:
                 return True  # Already loaded
             
-            # Load model in thread pool with timeout
             def _load_model():
                 try:
                     from sentence_transformers import SentenceTransformer
                     local_model_name = self.valves.embedding_model_name if self.valves.embedding_provider_type == 'local' else 'all-MiniLM-L6-v2'
-                    logger.info(f"Loading local embedding model: {local_model_name}")
                     return SentenceTransformer(local_model_name)
                 except Exception as e:
                     logger.error(f"Failed to load local SentenceTransformer model: {e}")
                     return None
-            
-            model = await asyncio.wait_for(
-                asyncio.to_thread(_load_model),
-                timeout=timeout_seconds
-            )
-            
+            model = await asyncio.wait_for(asyncio.to_thread(_load_model), timeout=timeout_seconds)
             if model is not None:
                 self._embedding_model = model
-                logger.info("Successfully loaded embedding model with timeout protection")
                 return True
-            else:
-                logger.error("Failed to load embedding model")
-                return False
+            logger.error("Failed to load embedding model")
+            return False
                 
         except asyncio.TimeoutError:
             logger.error(f"Embedding model loading timed out after {timeout_seconds} seconds")
@@ -1266,114 +169,25 @@ class Filter:
         return self._relevance_cache
 
     class Valves(BaseModel):
-        """
-        Configuration valves for the filter
         
-        Configuration Management Best Practices:
-        
-        1. VALIDATION: All configuration values are validated using Pydantic field validators
-           to prevent corruption and ensure type safety.
-           
-        2. PERSISTENCE: Configuration values are checked for persistence at the start of 
-           each major operation (inlet, outlet, memory processing) to prevent unexpected resets.
-           
-        3. RECOVERY: If configuration corruption is detected, the system automatically 
-           attempts recovery using default values while logging the issue.
-           
-        4. INTEGRITY CHECKS: Critical configuration values are validated to ensure they
-           maintain logical consistency (e.g., thresholds within valid ranges).
-           
-        5. SERIALIZATION: Configuration state is properly serialized and can be dumped
-           for debugging purposes.
-           
-        6. ERROR HANDLING: All configuration operations include comprehensive error handling
-           to prevent system failures due to configuration issues.
-           
-        7. LOGGING: Configuration loading, validation, and recovery operations are logged
-           for debugging and monitoring purposes.
-        """
-        
-        # Configuration management settings
         model_config = {"extra": "forbid", "validate_assignment": True}
-
-        # ------ Begin Embedding Model Configuration ------ ADDED
-        embedding_provider_type: Literal["local", "openai_compatible"] = Field(
-            default="local",
-            description="Type of embedding provider ('local' for SentenceTransformer or 'openai_compatible' for API)",
-        )
-        embedding_model_name: str = Field(
-            default="all-MiniLM-L6-v2",  # Default to the local model
-            description="Name of the embedding model to use (e.g., 'all-MiniLM-L6-v2', 'text-embedding-3-small')",
-        )
-        embedding_api_url: Optional[str] = Field(
-            default=None,
-            description="API endpoint URL for the embedding provider (required if type is 'openai_compatible')",
-        )
-        embedding_api_key: Optional[str] = Field(
-            default=None,
-            description="API Key for the embedding provider (required if type is 'openai_compatible')",
-        )
-        # ------ End Embedding Model Configuration ------
-
-        # ------ Begin Background Task Management Configuration ------
-        enable_summarization_task: bool = Field(
-            default=True,
-            description="Enable or disable the background memory summarization task"
-        )
-        summarization_interval: int = Field(
-            default=7200,  # 2 hours performance setting
-            description="Interval in seconds between memory summarization runs"
-        )
-        
-        enable_error_logging_task: bool = Field(
-            default=True,
-            description="Enable or disable the background error counter logging task"
-        )
-        error_logging_interval: int = Field(
-            default=1800,  # 30 minutes performance setting
-            description="Interval in seconds between error counter log entries"
-        )
-        
-        enable_date_update_task: bool = Field(
-            default=True,
-            description="Enable or disable the background date update task"
-        )
-        date_update_interval: int = Field(
-            default=3600,  # 1 hour performance setting
-            description="Interval in seconds between date information updates"
-        )
-        
-        enable_model_discovery_task: bool = Field(
-            default=True,
-            description="Enable or disable the background model discovery task"
-        )
-        model_discovery_interval: int = Field(
-            default=7200,  # 2 hours performance setting
-            description="Interval in seconds between model discovery runs"
-        )
-        # ------ End Background Task Management Configuration ------
-        
-        # ------ Begin Summarization Configuration ------
-        summarization_min_cluster_size: int = Field(
-            default=3,
-            description="Minimum number of memories in a cluster for summarization"
-        )
-        summarization_similarity_threshold: float = Field(
-            default=0.7,
-            description="Threshold for considering memories related when using embedding similarity"
-        )
-        summarization_max_cluster_size: int = Field(
-            default=8,
-            description="Maximum memories to include in one summarization batch"
-        )
-        summarization_min_memory_age_days: int = Field(
-            default=7,
-            description="Minimum age in days for memories to be considered for summarization"
-        )
-        summarization_strategy: Literal["embeddings", "tags", "hybrid"] = Field(
-            default="hybrid",
-            description="Strategy for clustering memories: 'embeddings' (semantic similarity), 'tags' (shared tags), or 'hybrid' (combination)"
-        )
+        embedding_provider_type: Literal["local", "openai_compatible"] = Field(default="local", description="Type of embedding provider")
+        embedding_model_name: str = Field(default="all-MiniLM-L6-v2", description="Embedding model name")
+        embedding_api_url: Optional[str] = Field(default=None, description="Embedding API endpoint URL")
+        embedding_api_key: Optional[str] = Field(default=None, description="Embedding API Key")
+        enable_summarization_task: bool = Field(default=True, description="Enable memory summarization task")
+        summarization_interval: int = Field(default=7200, description="Summarization interval in seconds")
+        enable_error_logging_task: bool = Field(default=True, description="Enable error counter logging task")
+        error_logging_interval: int = Field(default=1800, description="Error logging interval in seconds")
+        enable_date_update_task: bool = Field(default=True, description="Enable date update task")
+        date_update_interval: int = Field(default=3600, description="Date update interval in seconds")
+        enable_model_discovery_task: bool = Field(default=True, description="Enable model discovery task")
+        model_discovery_interval: int = Field(default=7200, description="Model discovery interval in seconds")
+        summarization_min_cluster_size: int = Field(default=3, description="Min cluster size for summarization")
+        summarization_similarity_threshold: float = Field(default=0.7, description="Similarity threshold for clustering")
+        summarization_max_cluster_size: int = Field(default=8, description="Max memories per summarization batch")
+        summarization_min_memory_age_days: int = Field(default=7, description="Min age for summarization")
+        summarization_strategy: Literal["embeddings", "tags", "hybrid"] = Field(default="hybrid", description="Clustering strategy")
         summarization_memory_prompt: str = Field(
             default="""You are a memory summarization assistant. Your task is to combine related memories about a user into a concise, comprehensive summary.
 
@@ -1409,220 +223,58 @@ Analyze the following related memories and provide a concise summary.""",
         )
         # ------ End Summarization Configuration ------
         
-        # ------ Begin Filtering & Saving Configuration ------
-        enable_json_stripping: bool = Field(
-            default=True,
-            description="Attempt to strip non-JSON text before/after the main JSON object/array from LLM responses."
-        )
-        enable_fallback_regex: bool = Field(
-            default=True,  # Enable for performance fallback
-            description="If primary JSON parsing fails, attempt a simple regex fallback to extract at least one memory."
-        )
-        enable_short_preference_shortcut: bool = Field(
-            default=True,
-            description="If JSON parsing fails for a short message containing preference keywords, directly save the message content."
-        )
+        enable_json_stripping: bool = Field(default=True, description="Strip non-JSON text from LLM responses")
+        enable_fallback_regex: bool = Field(default=True, description="Use regex fallback for JSON parsing")
+        enable_short_preference_shortcut: bool = Field(default=True, description="Save short preference messages directly")
         enable_feature_detection: bool = Field(
             default=True,
             description="Enable automatic detection of LLM provider capabilities for adaptive behavior and fallback mechanisms."
         )
-        # --- NEW: Deduplication bypass for short preference statements ---
-        short_preference_no_dedupe_length: int = Field(
-            default=100,  # Allow longer short-preference statements to bypass deduplication
-            description="If a NEW memory's content length is below this threshold and contains preference keywords, skip deduplication checks to avoid false positives."
-        )
-        preference_keywords_no_dedupe: str = Field(
-            default="favorite,love,like,prefer,enjoy",
-            description="Comma-separated keywords indicating user preferences that, when present in a short statement, trigger deduplication bypass."
-        )
+        short_preference_no_dedupe_length: int = Field(default=100)
+        preference_keywords_no_dedupe: str = Field(default="favorite,love,like,prefer,enjoy")
 
-        # Blacklist topics (comma-separated substrings) - NOW OPTIONAL
-        blacklist_topics: Optional[str] = Field(
-            default=None,  # Default to None instead of empty string or default list
-            description="Optional: Comma-separated list of topics to ignore during memory extraction",
-        )
+        blacklist_topics: Optional[str] = Field(default=None)
+        filter_trivia: bool = Field(default=True)
+        whitelist_keywords: Optional[str] = Field(default=None)
 
-        # Enable trivia filtering
-        filter_trivia: bool = Field(
-            default=True,
-            description="Enable filtering of trivia/general knowledge memories after extraction",
-        )
+        max_total_memories: int = Field(default=200)
+        pruning_strategy: Literal["fifo", "least_relevant"] = Field(default="fifo")
+        min_memory_length: int = Field(default=8)
+        min_confidence_threshold: float = Field(default=0.5)
 
-        # Whitelist keywords (comma-separated substrings) - NOW OPTIONAL
-        whitelist_keywords: Optional[str] = Field(
-            default=None,  # Default to None
-            description="Optional: Comma-separated keywords that force-save a memory even if blacklisted",
-        )
+        recent_messages_n: int = Field(default=5)
+        save_relevance_threshold: float = Field(default=0.8)
+        max_injected_memory_length: int = Field(default=300)
 
-        # Maximum total memories per user
-        max_total_memories: int = Field(
-            default=200,
-            description="Maximum number of memories per user; prune oldest beyond this",
-        )
+        llm_provider_type: Literal["ollama", "openai_compatible", "gemini"] = Field(default="ollama")
+        llm_model_name: str = Field(default="llama3:latest")
+        llm_api_endpoint_url: str = Field(default="http://host.docker.internal:11434/api/chat")
+        llm_api_key: Optional[str] = Field(default=None)
 
-        pruning_strategy: Literal["fifo", "least_relevant"] = Field(
-            default="fifo",
-            description="Strategy for pruning memories when max_total_memories is exceeded: 'fifo' (oldest first) or 'least_relevant' (lowest relevance to current message first).",
-        )
+        related_memories_n: int = Field(default=5)
+        relevance_threshold: float = Field(default=0.45)
+        memory_threshold: float = Field(default=0.6)
 
-        # Minimum memory length
-        min_memory_length: int = Field(
-            default=8, # Lowered default from 10
-            description="Minimum length of memory content to be saved",
-        )
+        vector_similarity_threshold: float = Field(default=0.45)
+        llm_skip_relevance_threshold: float = Field(default=0.93)
+        top_n_memories: int = Field(default=3)
+        cache_ttl_seconds: int = Field(default=86400)
 
-        # --- NEW: Confidence Score Threshold ---
-        min_confidence_threshold: float = Field(
-            default=0.5,  # Default minimum confidence score to save a memory
-            description="Minimum confidence score (0-1) required for an extracted memory to be saved. Scores below this are discarded."
-        )
-        # --- END NEW ---
+        use_llm_for_relevance: bool = Field(default=False)
+        deduplicate_memories: bool = Field(default=True)
+        use_embeddings_for_deduplication: bool = Field(default=True)
+        embedding_similarity_threshold: float = Field(default=0.97)
+        similarity_threshold: float = Field(default=0.95)
 
-        # Number of recent user messages to include in extraction context
-        recent_messages_n: int = Field(
-            default=5,
-            description="Number of recent user messages to include in extraction prompt context",
-        )
+        use_fingerprinting: bool = Field(default=True)
+        fingerprint_similarity_threshold: float = Field(default=0.8)
+        fingerprint_num_hashes: int = Field(default=128)
+        fingerprint_shingle_size: int = Field(default=3)
+        use_lsh_optimization: bool = Field(default=True)
+        lsh_threshold_for_activation: int = Field(default=100)
+        use_enhanced_confidence_scoring: bool = Field(default=True)
+        confidence_scoring_combined_threshold: float = Field(default=0.7)
 
-        # Relevance threshold for saving memories
-        save_relevance_threshold: float = Field(
-            default=0.8,
-            description="Minimum relevance score (based on relevance calculation method) to save a memory",
-        )
-
-        # Max length of injected memory content (characters)
-        max_injected_memory_length: int = Field(
-            default=300,
-            description="Maximum length of each injected memory snippet",
-        )
-
-        # --- Generic LLM Provider Configuration ---
-        llm_provider_type: Literal["ollama", "openai_compatible", "gemini"] = Field(
-            default="ollama",
-            description="Type of LLM provider ('ollama', 'openai_compatible', or 'gemini')",
-        )
-        llm_model_name: str = Field(
-            default="llama3:latest",  # Default sensible for Ollama
-            description="Name of the LLM model to use (e.g., 'llama3:latest', 'gpt-4o')",
-        )
-        llm_api_endpoint_url: str = Field(
-            # Change default to use host.docker.internal for accessing Ollama on host
-            default="http://host.docker.internal:11434/api/chat",
-            description="API endpoint URL for the LLM provider (e.g., 'http://host.docker.internal:11434/api/chat', 'https://api.openai.com/v1/chat/completions', 'https://generativelanguage.googleapis.com/v1beta/openai/')",
-        )
-        llm_api_key: Optional[str] = Field(
-            default=None,
-            description="API Key for the LLM provider (required if type is 'openai_compatible' or 'gemini')",
-        )
-        # --- End Generic LLM Provider Configuration ---
-
-        # Memory processing settings
-        related_memories_n: int = Field(
-            default=5,
-            description="Number of related memories to consider",
-        )
-        relevance_threshold: float = Field(
-            default=0.45, # Lowered to improve memory retrieval
-            description="Minimum relevance score (0-1) for memories to be considered relevant for injection after scoring"
-        )
-        memory_threshold: float = Field(
-            default=0.6,
-            description="Threshold for similarity when comparing memories (0-1)",
-        )
-
-        # Upgrade plan configs
-        vector_similarity_threshold: float = Field(
-            default=0.45,  # Lowered to improve memory retrieval
-            description="Minimum cosine similarity for initial vector filtering (0-1)"
-        )
-        # NEW: If vector similarities are confidently high, skip the expensive LLM relevance call even
-        #       when `use_llm_for_relevance` is True. This reduces overall LLM usage (Improvement #5).
-        llm_skip_relevance_threshold: float = Field(
-            default=0.93, # Slightly higher to reduce frequency of LLM calls (performance tuning)
-            description="If *all* vector-filtered memories have similarity >= this threshold, treat the vector score as final relevance and skip the additional LLM call."
-        )
-        top_n_memories: int = Field(
-            default=3, # Performance setting
-            description="Number of top similar memories to pass to LLM",
-        )
-        cache_ttl_seconds: int = Field(
-            default=86400,
-            description="Cache time-to-live in seconds (default 24 hours)",
-        )
-
-        # --- Relevance Calculation Configuration ---
-        use_llm_for_relevance: bool = Field(
-            default=False, # Performance setting: rely on vector similarity
-            description="Use LLM call for final relevance scoring (if False, relies solely on vector similarity + relevance_threshold)",
-        )
-        # --- End Relevance Calculation Configuration ---
-
-        # Deduplicate identical memories
-        deduplicate_memories: bool = Field(
-            default=True,
-            description="Prevent storing duplicate or very similar memories",
-        )
-
-        use_embeddings_for_deduplication: bool = Field(
-            default=True,
-            description="Use embedding-based similarity for more accurate semantic duplicate detection (if False, uses text-based similarity)",
-        )
-
-        # NEW: Dedicated threshold for embedding-based duplicate detection (higher because embeddings are tighter)
-        embedding_similarity_threshold: float = Field(
-            default=0.97,
-            description="Threshold (0-1) for considering two memories duplicates when using embedding similarity."
-        )
-
-        similarity_threshold: float = Field(
-            default=0.95,  # Tighten duplicate detection to minimise false positives
-            description="Threshold for detecting similar memories (0-1) using text or embeddings"
-        )
-
-        # MinHash Fingerprinting settings
-        use_fingerprinting: bool = Field(
-            default=True,
-            description="Use MinHash fingerprinting for enhanced duplicate detection and scalability"
-        )
-        
-        fingerprint_similarity_threshold: float = Field(
-            default=0.8,
-            description="Threshold (0-1) for considering two memory fingerprints as duplicates"
-        )
-        
-        fingerprint_num_hashes: int = Field(
-            default=128,
-            description="Number of hash functions for MinHash (more = higher precision, slower)"
-        )
-        
-        fingerprint_shingle_size: int = Field(
-            default=3,
-            description="Size of text shingles for fingerprinting (3-grams are typical)"
-        )
-        
-        # LSH (Locality Sensitive Hashing) settings
-        use_lsh_optimization: bool = Field(
-            default=True,
-            description="Use LSH to optimize duplicate detection performance (reduces comparisons)"
-        )
-        
-        lsh_threshold_for_activation: int = Field(
-            default=100,
-            description="Minimum number of existing memories before LSH optimization is activated"
-        )
-        
-        # Enhanced Confidence Scoring settings
-        use_enhanced_confidence_scoring: bool = Field(
-            default=True,
-            description="Use enhanced multi-factor confidence scoring for duplicate detection"
-        )
-        
-        confidence_scoring_combined_threshold: float = Field(
-            default=0.7,
-            description="Threshold for combined confidence score to consider as duplicate"
-        )
-
-        # Time settings
         timezone: str = Field(
             default="Asia/Dubai",
             description="Timezone for date/time processing (e.g., 'America/New_York', 'Europe/London')",
@@ -1632,168 +284,27 @@ Analyze the following related memories and provide a concise summary.""",
         show_status: bool = Field(
             default=True, description="Show memory operations status in chat"
         )
-        show_memories: bool = Field(
-            default=True, description="Show relevant memories in context"
-        )
-        memory_format: Literal["bullet", "paragraph", "numbered"] = Field(
-            default="bullet", description="Format for displaying memories in context"
-        )
+        show_memories: bool = Field(default=True)
+        memory_format: Literal["bullet", "paragraph", "numbered"] = Field(default="bullet")
+        enable_identity_memories: bool = Field(default=True)
+        enable_behavior_memories: bool = Field(default=True)
+        enable_preference_memories: bool = Field(default=True)
+        enable_goal_memories: bool = Field(default=True)
+        enable_relationship_memories: bool = Field(default=True)
+        enable_possession_memories: bool = Field(default=True)
+        max_retries: int = Field(default=2)
+        retry_delay: float = Field(default=1.0)
 
-        # Memory categories
-        enable_identity_memories: bool = Field(
-            default=True,
-            description="Enable collecting Basic Identity information (age, gender, location, etc.)",
-        )
-        enable_behavior_memories: bool = Field(
-            default=True,
-            description="Enable collecting Behavior information (interests, habits, etc.)",
-        )
-        enable_preference_memories: bool = Field(
-            default=True,
-            description="Enable collecting Preference information (likes, dislikes, etc.)",
-        )
-        enable_goal_memories: bool = Field(
-            default=True,
-            description="Enable collecting Goal information (aspirations, targets, etc.)",
-        )
-        enable_relationship_memories: bool = Field(
-            default=True,
-            description="Enable collecting Relationship information (friends, family, etc.)",
-        )
-        enable_possession_memories: bool = Field(
-            default=True,
-            description="Enable collecting Possession information (things owned or desired)",
-        )
-
-        # Error handling
-        max_retries: int = Field(
-            default=2, description="Maximum number of retries for API calls"
-        )
-
-        retry_delay: float = Field(
-            default=1.0, description="Delay between retries (seconds)"
-        )
-
-        # System prompts
         memory_identification_prompt: str = Field(
-            default='''You are an automated JSON data extraction system. Your ONLY function is to identify user-specific, persistent facts, preferences, goals, relationships, or interests from the user's messages and output them STRICTLY as a JSON array of operations.
-
-**ABSOLUTE OUTPUT REQUIREMENT: FAILURE TO COMPLY WILL BREAK THE SYSTEM.**
-1.  Your **ENTIRE** response **MUST** be **ONLY** a valid JSON array starting with `[` and ending with `]`. 
-2.  **NO EXTRA TEXT**: Do **NOT** include **ANY** text, explanations, greetings, apologies, notes, or markdown formatting (like ```json) before or after the JSON array. 
-3.  **ARRAY ALWAYS**: Even if you find only one memory, it **MUST** be enclosed in an array: `[{"operation": ...}]`. Do **NOT** output a single JSON object `{...}`.
-4.  **EMPTY ARRAY**: If NO relevant user-specific memories are found, output **ONLY** an empty JSON array: `[]`.
-
-**JSON OBJECT STRUCTURE (Each element in the array):**
-*   Each element **MUST** be a JSON object: `{"operation": "NEW", "content": "...", "tags": ["..."], "memory_bank": "...", "confidence": float}`
-*   **confidence**: You **MUST** include a confidence score (float between 0.0 and 1.0) indicating certainty that the extracted text is a persistent user fact/preference. High confidence (0.8-1.0) for direct statements, lower (0.5-0.7) for inferences or less certain preferences.
-*   **memory_bank**: You **MUST** include a `memory_bank` field, choosing from: "General", "Personal", "Work". Default to "General" if unsure.
-*   **tags**: You **MUST** include a `tags` field with a list of relevant tags from: ["identity", "behavior", "preference", "goal", "relationship", "possession"].
-
-**INFORMATION TO EXTRACT (User-Specific ONLY):**
-*   **Explicit Preferences/Statements:** User states "I love X", "My favorite is Y", "I enjoy Z". Extract these verbatim with high confidence.
-*   **Identity:** Name, location, age, profession, etc. (high confidence)
-*   **Goals:** Aspirations, plans (medium/high confidence depending on certainty).
-*   **Relationships:** Mentions of family, friends, colleagues (high confidence).
-*   **Possessions:** Things owned or desired (medium/high confidence).
-*   **Behaviors/Interests:** Topics the user discusses or asks about (implying interest - medium confidence).
-
-**RULES (Reiteration - Critical):**
-+1. **JSON ARRAY ONLY**: `[`...`]` - Nothing else!
-+2. **CONFIDENCE REQUIRED**: Every object needs a `"confidence": float` field.
-+3. **MEMORY BANK REQUIRED**: Every object needs a `"memory_bank": "..."` field.
-+4. **TAGS REQUIRED**: Every object needs a `"tags": [...]` field.
-+5. **USER INFO ONLY**: Discard trivia, questions *to* the AI, temporary thoughts.
-
-**FAILURE EXAMPLES (DO NOT DO THIS):**
-*   `Okay, here is the JSON: [...]` <-- INVALID (extra text)
-*   ` ```json
-[{"operation": ...}]
-``` ` <-- INVALID (markdown)
-*   `{"memories": [...]}` <-- INVALID (not an array)
-*   `{"operation": ...}` <-- INVALID (not in an array)
-*   `[{"operation": ..., "content": ..., "tags": [...]}]` <-- INVALID (missing confidence/bank)
-
-**GOOD EXAMPLE OUTPUT (Strictly adhere to this):**
-```
-[
-  {
-    "operation": "NEW",
-    "content": "User has been a software engineer for 8 years",
-    "tags": ["identity", "behavior"],
-    "memory_bank": "Work",
-    "confidence": 0.95
-  },
-  {
-    "operation": "NEW",
-    "content": "User has a cat named Whiskers",
-    "tags": ["relationship", "possession"],
-    "memory_bank": "Personal",
-    "confidence": 0.9
-  },
-  {
-    "operation": "NEW",
-    "content": "User prefers working remotely",
-    "tags": ["preference", "behavior"],
-    "memory_bank": "Work",
-    "confidence": 0.7
-  },
-  {
-    "operation": "NEW",
-    "content": "User's favorite book might be The Hitchhiker's Guide to the Galaxy",
-    "tags": ["preference"],
-    "memory_bank": "Personal",
-    "confidence": 0.6
-  }
-]
-```
-
-Analyze the following user message(s) and provide **ONLY** the JSON array output. Double-check your response starts with `[` and ends with `]` and contains **NO** other text whatsoever.''', # Use triple single quotes for multiline string
-            description="System prompt for memory identification (Emphasizing strict JSON array output and required fields)",
+            default='''Extract user-specific info as JSON array only. Format: [{"operation":"NEW","content":"text","tags":["list"],"memory_bank":"category","confidence":0.0-1.0}]. Extract: preferences, identity, goals, relationships, possessions, interests. Return only valid JSON array starting with [ and ending with ].'''
         )
 
         memory_relevance_prompt: str = Field(
-            default="""You are a memory retrieval assistant. Your task is to determine which memories are relevant to the current context of a conversation.
-
-IMPORTANT: **Do NOT mark general knowledge, trivia, or unrelated facts as relevant.** Only user-specific, persistent information should be rated highly.
-
-Given the current user message and a set of memories, rate each memory's relevance on a scale from 0 to 1, where:
-- 0 means completely irrelevant
-- 1 means highly relevant and directly applicable
-
-Consider:
-- Explicit mentions in the user message
-- Implicit connections to the user's personal info, preferences, goals, or relationships
-- Potential usefulness for answering questions **about the user**
-- Recency and importance of the memory
-
-Examples:
-- "User likes coffee" → likely relevant if coffee is mentioned
-- "World War II started in 1939" → **irrelevant trivia, rate near 0**
-- "User's friend is named Sarah" → relevant if friend is mentioned
-
-Return your analysis as a JSON array with each memory's content, ID, and relevance score.
-Example: [{"memory": "User likes coffee", "id": "123", "relevance": 0.8}]
-
-Your output must be valid JSON only. No additional text.""",
-            description="System prompt for memory relevance assessment",
+            default="""Rate memory relevance 0-1 for user context. Only user-specific info rates high, not trivia. Return JSON: [{"memory":"text","id":"123","relevance":0.8}]"""
         )
 
         memory_merge_prompt: str = Field(
-            default="""You are a memory consolidation assistant. When given sets of memories, you merge similar or related memories while preserving all important information.
-
-IMPORTANT: **Do NOT merge general knowledge, trivia, or unrelated facts.** Only merge user-specific, persistent information.
-
-Rules for merging:
-1. If two memories contradict, keep the newer information
-2. Combine complementary information into a single comprehensive memory
-3. Maintain the most specific details when merging
-4. If two memories are distinct enough, keep them separate
-5. Remove duplicate memories
-
-Return your result as a JSON array of strings, with each string being a merged memory.
-Your output must be valid JSON only. No additional text.""",
-            description="System prompt for merging memories",
+            default="""Merge similar user memories. Keep newer info if contradictory. Return JSON: ["merged memory text"]"""
         )
 
         @field_validator(
@@ -1852,1099 +363,335 @@ Your output must be valid JSON only. No additional text.""",
         
         @field_validator('allowed_memory_banks')
         def validate_memory_banks(cls, v):
-            """Validate allowed_memory_banks to prevent corruption issues"""
-            if not isinstance(v, list):
-                logger.warning(f"allowed_memory_banks is not a list: {type(v)}, resetting to default")
+            if not isinstance(v, list) or not v:
                 return ["General", "Personal", "Work"]
-            
-            if not v or v == [''] or v == [None]:
-                logger.warning(f"allowed_memory_banks is empty or contains invalid values: {v}, resetting to default")
-                return ["General", "Personal", "Work"]
-            
-            # Filter out empty/None values and ensure they're strings
-            valid_banks = []
-            for bank in v:
-                if bank and isinstance(bank, str) and bank.strip():
-                    valid_banks.append(bank.strip())
-            
-            if not valid_banks:
-                logger.warning("No valid memory banks found after filtering, resetting to default")
-                return ["General", "Personal", "Work"]
-            
-            return valid_banks
+            valid_banks = [bank.strip() for bank in v if bank and isinstance(bank, str) and bank.strip()]
+            return valid_banks if valid_banks else ["General", "Personal", "Work"]
         
         @field_validator('default_memory_bank')
         def validate_default_memory_bank(cls, v, values):
-            """Ensure default_memory_bank is in allowed_memory_banks"""
-            if not v or not isinstance(v, str) or not v.strip():
-                return "General"
-            
-            # Note: In Pydantic v2, we can't easily access other field values in field validators
-            # This will be handled in the model validator
-            return v.strip()
+            return v.strip() if v and isinstance(v, str) and v.strip() else "General"
         
-        @field_validator('min_confidence_threshold', 'relevance_threshold', 'vector_similarity_threshold', 
-                        'similarity_threshold', 'embedding_similarity_threshold')
-        def validate_thresholds(cls, v):
-            """Validate threshold values are within valid range"""
-            if not isinstance(v, (int, float)):
-                raise ValueError(f"Threshold must be a number, got {type(v)}")
-            
-            if not 0.0 <= v <= 1.0:
-                raise ValueError(f"Threshold must be between 0.0 and 1.0, got {v}")
-            
-            return float(v)
-        
-        @field_validator('max_total_memories', 'min_memory_length', 'recent_messages_n', 
-                        'related_memories_n', 'top_n_memories')
-        def validate_positive_integers(cls, v):
-            """Validate positive integer values"""
-            if not isinstance(v, int) or v < 1:
-                raise ValueError(f"Value must be a positive integer, got {v}")
-            return v
         
         @field_validator('llm_api_endpoint_url', 'embedding_api_url')
         def validate_api_urls(cls, v):
-            """Validate API URLs when provided"""
-            if v is None:
-                return v
-            
-            if not isinstance(v, str):
-                raise ValueError(f"API URL must be a string, got {type(v)}")
-            
+            if v is None or not isinstance(v, str): return v
             v = v.strip()
             if v and not v.startswith(('http://', 'https://')):
                 raise ValueError(f"API URL must start with http:// or https://, got: {v}")
-            
             return v
 
-        # Keep existing model validator for LLM config
         @model_validator(mode="after")
         def check_llm_config(self):
             if self.llm_provider_type in ["openai_compatible", "gemini"] and not self.llm_api_key:
-                raise ValueError(
-                    f"API Key (llm_api_key) is required when llm_provider_type is '{self.llm_provider_type}'"
-                )
-
-            # Basic URL validation for Ollama default
-            if self.llm_provider_type == "ollama":
-                if not self.llm_api_endpoint_url.startswith(("http://", "https://")):
-                    raise ValueError(
-                        "Ollama API Endpoint URL (llm_api_endpoint_url) must be a valid URL starting with http:// or https://"
-                    )
-                # Could add more specific Ollama URL checks if needed
-
-            # Basic URL validation for OpenAI compatible
-            if self.llm_provider_type == "openai_compatible":
-                if not self.llm_api_endpoint_url.startswith(("http://", "https://")):
-                    raise ValueError(
-                        "OpenAI Compatible API Endpoint URL (llm_api_endpoint_url) must be a valid URL starting with http:// or https://"
-                    )
-
+                raise ValueError(f"API Key required for '{self.llm_provider_type}'")
+            if not self.llm_api_endpoint_url.startswith(("http://", "https://")):
+                raise ValueError("Invalid API endpoint URL")
             return self
         
         @model_validator(mode="after")
         def check_embedding_config(self):
             if self.embedding_provider_type == "openai_compatible":
-                if not self.embedding_api_key:
-                    raise ValueError(
-                        "API Key (embedding_api_key) is required when embedding_provider_type is 'openai_compatible'"
-                    )
-                if not self.embedding_api_url:
-                    raise ValueError(
-                        "API URL (embedding_api_url) is required when embedding_provider_type is 'openai_compatible'"
-                    )
+                if not self.embedding_api_key or not self.embedding_api_url:
+                    raise ValueError("API Key and URL required for openai_compatible embedding")
             return self
         
         @model_validator(mode="after")
         def check_memory_bank_consistency(self):
-            """Ensure default_memory_bank is in allowed_memory_banks"""
             if self.default_memory_bank not in self.allowed_memory_banks:
-                logger.warning(
-                    f"default_memory_bank '{self.default_memory_bank}' not in allowed_memory_banks {self.allowed_memory_banks}. "
-                    f"Setting to first allowed bank."
-                )
                 self.default_memory_bank = self.allowed_memory_banks[0]
             return self
         
-        @model_validator(mode="after")
-        def check_threshold_consistency(self):
-            """Ensure threshold values are logically consistent"""
-            if self.vector_similarity_threshold > self.relevance_threshold:
-                logger.warning(
-                    f"vector_similarity_threshold ({self.vector_similarity_threshold}) is higher than "
-                    f"relevance_threshold ({self.relevance_threshold}). This may cause no memories to be retrieved."
-                )
-            
-            if self.similarity_threshold < self.embedding_similarity_threshold:
-                logger.warning(
-                    f"similarity_threshold ({self.similarity_threshold}) is lower than "
-                    f"embedding_similarity_threshold ({self.embedding_similarity_threshold}). "
-                    f"This may cause inconsistent deduplication behavior."
-                )
-            
-            return self
 
-        # --- End Pydantic Validators for Valves ---
+        debug_error_counter_logs: bool = Field(default=False)
+        allowed_memory_banks: List[str] = Field(default=["General", "Personal", "Work"])
+        default_memory_bank: str = Field(default="General")
+        enable_error_counter_guard: bool = Field(default=True)
+        error_guard_threshold: int = Field(default=5)
+        error_guard_window_seconds: int = Field(default=600)
 
-        # Control verbosity of error counter logging. When True, counters are logged at DEBUG level; when False, they are suppressed.
-        debug_error_counter_logs: bool = Field(
-            default=False,
-            description="Emit detailed error counter logs at DEBUG level (set to True for troubleshooting).",
-        )
+        enable_filter_orchestration: bool = Field(default=True, description="Enable filter orchestration")
+        filter_execution_timeout_ms: int = Field(default=10000)
+        enable_conflict_detection: bool = Field(default=True)
+        enable_performance_monitoring: bool = Field(default=True)
+        filter_priority: Literal["highest", "high", "normal", "low", "lowest"] = Field(default="normal")
+        enable_rollback_mechanism: bool = Field(default=True)
+        max_concurrent_filters: int = Field(default=5)
+        coordination_overhead_threshold_ms: float = Field(default=100.0)
+        enable_shared_state: bool = Field(default=False)
+        filter_isolation_level: Literal["none", "partial", "full"] = Field(default="partial")
+        request_timeout: float = Field(default=120.0, description="Request timeout in seconds")
+        connection_timeout: float = Field(default=30.0, description="Connection timeout in seconds")
+        max_concurrent_connections: int = Field(default=10, description="Max concurrent connections")
+        connection_pool_size: int = Field(default=20, description="Connection pool size")
+        enable_health_checks: bool = Field(default=True, description="Enable health checks")
+        health_check_interval: int = Field(default=300, description="Health check interval")
+        circuit_breaker_failure_threshold: int = Field(default=5, description="Circuit breaker threshold")
+        circuit_breaker_timeout: int = Field(default=60, description="Circuit breaker timeout")
+        enable_connection_pooling: bool = Field(default=True, description="Enable connection pooling")
+        connection_keepalive_timeout: int = Field(default=30, description="Keep-alive timeout")
+        dns_cache_ttl: int = Field(default=300, description="DNS cache TTL")
+        enable_connection_diagnostics: bool = Field(default=True, description="Enable diagnostics")
+        max_connection_retries: int = Field(default=3, description="Max retry attempts")
+        connection_retry_delay: float = Field(default=2.0, description="Retry delay")
 
-        # ------ End Filtering & Saving Configuration ------
-
-        # ------ Begin Memory Bank Configuration ------
-        allowed_memory_banks: List[str] = Field(
-            default=["General", "Personal", "Work"],
-            description="List of allowed memory bank names for categorization."
-        )
-        default_memory_bank: str = Field(
-            default="General",
-            description="Default memory bank assigned when LLM omits or supplies an invalid bank."
-        )
-        # ------ End Memory Bank Configuration ------
-
-        # ------ Begin Error Handling & Guarding Configuration (single authoritative block) ------
-        enable_error_counter_guard: bool = Field(
-            default=True,
-            description="Enable guard to temporarily disable LLM/embedding features if specific error rates spike."
-        )
-        error_guard_threshold: int = Field(
-            default=5,
-            description="Number of errors within the window required to activate the guard."
-        )
-        error_guard_window_seconds: int = Field(
-            default=600,  # 10 minutes
-            description="Rolling time-window (in seconds) over which errors are counted for guarding logic."
-        )
-        # ------ End Error Handling & Guarding Configuration ------
-
-        # ------ Begin Filter Orchestration Configuration ------
-        enable_filter_orchestration: bool = Field(
-            default=True,
-            description="Enable filter orchestration and coordination features"
-        )
-        filter_execution_timeout_ms: int = Field(
-            default=10000,
-            description="Maximum execution time for filter operations in milliseconds"
-        )
-        enable_conflict_detection: bool = Field(
-            default=True,
-            description="Enable detection of conflicts with other filters"
-        )
-        enable_performance_monitoring: bool = Field(
-            default=True,
-            description="Enable performance monitoring for filter orchestration"
-        )
-        filter_priority: Literal["highest", "high", "normal", "low", "lowest"] = Field(
-            default="normal",
-            description="Priority level for this filter in execution order"
-        )
-        enable_rollback_mechanism: bool = Field(
-            default=True,
-            description="Enable rollback mechanism for failed operations"
-        )
-        max_concurrent_filters: int = Field(
-            default=5,
-            description="Maximum number of filters that can run concurrently"
-        )
-        coordination_overhead_threshold_ms: float = Field(
-            default=100.0,
-            description="Maximum acceptable coordination overhead in milliseconds"
-        )
-        enable_shared_state: bool = Field(
-            default=False,
-            description="Enable sharing state with other filters (experimental)"
-        )
-        filter_isolation_level: Literal["none", "partial", "full"] = Field(
-            default="partial",
-            description="Level of isolation from other filters: none=no isolation, partial=state isolation, full=complete isolation"
-        )
-        # ------ End Filter Orchestration Configuration ------
-
-        # ------ Begin LLM Connection & Circuit Breaker Configuration ------
-        request_timeout: float = Field(
-            default=120.0,
-            description="Request timeout in seconds for LLM API calls"
-        )
-        connection_timeout: float = Field(
-            default=30.0,
-            description="Connection timeout in seconds for LLM API connections"
-        )
-        max_concurrent_connections: int = Field(
-            default=10,
-            description="Maximum number of concurrent connections to LLM API"
-        )
-        connection_pool_size: int = Field(
-            default=20,
-            description="Size of the connection pool for HTTP connections"
-        )
-        enable_health_checks: bool = Field(
-            default=True,
-            description="Enable periodic health checks for LLM endpoints"
-        )
-        health_check_interval: int = Field(
-            default=300,
-            description="Interval in seconds between health checks"
-        )
-        circuit_breaker_failure_threshold: int = Field(
-            default=5,
-            description="Number of consecutive failures before opening circuit breaker"
-        )
-        circuit_breaker_timeout: int = Field(
-            default=60,
-            description="Time in seconds before attempting to close circuit breaker"
-        )
-        enable_connection_pooling: bool = Field(
-            default=True,
-            description="Enable HTTP connection pooling for improved performance"
-        )
-        connection_keepalive_timeout: int = Field(
-            default=30,
-            description="Keep-alive timeout for HTTP connections in seconds"
-        )
-        dns_cache_ttl: int = Field(
-            default=300,
-            description="DNS cache TTL in seconds for connection optimization"
-        )
-        enable_connection_diagnostics: bool = Field(
-            default=True,
-            description="Enable detailed connection diagnostics and logging"
-        )
-        max_connection_retries: int = Field(
-            default=3,
-            description="Maximum number of connection retry attempts"
-        )
-        connection_retry_delay: float = Field(
-            default=2.0,
-            description="Base delay in seconds between connection retry attempts"
-        )
-        # ------ End LLM Connection & Circuit Breaker Configuration ------
-
-        @field_validator(
-            'allowed_memory_banks', # Add validation for this field
-            check_fields=False # Run even if other validation fails
-        )
-        def check_allowed_memory_banks(cls, v):
-            if not isinstance(v, list) or not v or v == ['']:
-                logger.warning(f"Invalid 'allowed_memory_banks' loaded: {v}. Falling back to default.")
-                # Return the default defined in the model itself
-                return cls.model_fields['allowed_memory_banks'].default
-            # Ensure all items are strings and non-empty after stripping
-            cleaned_list = [str(item).strip() for item in v if str(item).strip()]
-            if not cleaned_list:
-                logger.warning(f"Empty list after cleaning 'allowed_memory_banks': {v}. Falling back to default.")
-                return cls.model_fields['allowed_memory_banks'].default
-            return cleaned_list # Return the cleaned list
-
-        # --- Duplicate embedding config validator removed - handled above ---
 
     class UserValves(BaseModel):
-        enabled: bool = Field(
-            default=True, description="Enable or disable the memory function"
-        )
-        show_status: bool = Field(
-            default=True, description="Show memory processing status updates"
-        )
-        timezone: str = Field(
-            default="",
-            description="User's timezone (overrides global setting if provided)",
-        )
+        enabled: bool = Field(default=True, description="Enable or disable the memory function")
+        show_status: bool = Field(default=True, description="Show memory processing status updates")
+        timezone: str = Field(default="", description="User's timezone")
 
     def _load_configuration_safe(self) -> Dict[str, Any]:
-        """Safely load configuration with error handling and validation"""
-        config_data = {}
-        
         try:
-            # Check if config attribute exists and has valves
-            if hasattr(self, "config") and isinstance(self.config, dict):
-                if "valves" in self.config and isinstance(self.config["valves"], dict):
-                    config_data = self.config["valves"]
-                    logger.info("Found 'valves' key in self.config during configuration load.")
-                else:
-                    logger.info("self.config exists but lacks a 'valves' key, using defaults.")
-            else:
-                logger.info("self.config does not exist or is not a dict, using defaults.")
-                
-        except Exception as e:
-            logger.error(f"Error accessing self.config: {e}. Using defaults.")
-            
-        return config_data
+            return self.config.get("valves", {}) if isinstance(self.config, dict) else {}
+        except:
+            return {}
     
     def _validate_configuration_integrity(self, valves_instance) -> bool:
-        """Validate that critical configuration values are properly set"""
         try:
-            # Check critical fields that are prone to corruption
-            critical_checks = [
-                ("allowed_memory_banks", list, lambda x: len(x) > 0 and all(isinstance(b, str) and b.strip() for b in x)),
-                ("default_memory_bank", str, lambda x: x and x.strip()),
-                ("vector_similarity_threshold", (int, float), lambda x: 0.0 <= x <= 1.0),
-                ("relevance_threshold", (int, float), lambda x: 0.0 <= x <= 1.0),
-                ("llm_api_endpoint_url", str, lambda x: x and (x.startswith("http://") or x.startswith("https://"))),
-            ]
-            
-            for field_name, expected_type, validator in critical_checks:
-                value = getattr(valves_instance, field_name, None)
-                
-                if not isinstance(value, expected_type):
-                    logger.warning(f"Configuration integrity check failed: {field_name} has wrong type {type(value)}, expected {expected_type}")
-                    return False
-                
-                if not validator(value):
-                    logger.warning(f"Configuration integrity check failed: {field_name} value {value} failed validation")
-                    return False
-            
-            logger.debug("Configuration integrity check passed")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error during configuration integrity check: {e}")
+            return all([
+                isinstance(valves_instance.allowed_memory_banks, list) and valves_instance.allowed_memory_banks,
+                isinstance(valves_instance.default_memory_bank, str) and valves_instance.default_memory_bank.strip(),
+                0.0 <= valves_instance.vector_similarity_threshold <= 1.0,
+                0.0 <= valves_instance.relevance_threshold <= 1.0,
+                valves_instance.llm_api_endpoint_url.startswith(("http://", "https://"))
+            ])
+        except:
             return False
     
-    def _recover_configuration(self, error_context="unknown"):
-        """Recover from configuration corruption by resetting to defaults"""
-        logger.warning(f"Recovering configuration due to {error_context}")
-        
+    def _recover_configuration(self):
         try:
-            # Create fresh default instance
-            default_valves = self.Valves()
-            
-            # Validate the defaults work
-            if self._validate_configuration_integrity(default_valves):
-                self.valves = default_valves
-                logger.info("Successfully recovered configuration with defaults")
-                return True
-            else:
-                logger.error("Even default configuration failed integrity check")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Failed to recover configuration: {e}")
+            self.valves = self.Valves()
+            return self._validate_configuration_integrity(self.valves)
+        except:
             return False
     
     def _persist_configuration_state(self):
-        """Save current configuration state for debugging"""
-        try:
-            config_state = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "valves_dict": self.valves.model_dump() if hasattr(self.valves, 'model_dump') else {},
-                "config_source": getattr(self, 'config', {}),
-            }
-            
-            # Log current state for debugging
-            logger.debug(f"Configuration state persisted: {json.dumps(config_state, indent=2)}")
-            
-        except Exception as e:
-            logger.error(f"Failed to persist configuration state: {e}")
+        pass
     
     def _validate_configuration_save(self, new_config: Dict[str, Any]) -> tuple[bool, str]:
-        """
-        Validate configuration before save operation
-        
-        Returns:
-            tuple[bool, str]: (is_valid, error_message)
-        """
         try:
-            # Test if new configuration can be instantiated
             test_valves = self.Valves(**new_config)
-            
-            # Run integrity check
             if not self._validate_configuration_integrity(test_valves):
                 return False, "Configuration failed integrity validation"
-            
-            # Validate critical endpoints are reachable (with timeout)
             if hasattr(test_valves, 'llm_api_endpoint_url') and test_valves.llm_api_endpoint_url:
                 try:
-                    # Quick connectivity check with short timeout
                     import urllib.parse
                     parsed_url = urllib.parse.urlparse(test_valves.llm_api_endpoint_url)
-                    if parsed_url.scheme and parsed_url.netloc:
-                        # URL format is valid
-                        pass
-                    else:
+                    if not (parsed_url.scheme and parsed_url.netloc):
                         return False, "Invalid LLM API endpoint URL format"
                 except Exception:
                     return False, "LLM API endpoint URL validation failed"
-            
             return True, "Configuration validation successful"
-            
         except Exception as e:
             return False, f"Configuration validation error: {str(e)}"
     
     def _is_system_ready_for_config_save(self) -> tuple[bool, str]:
-        """
-        Check if the system is ready to accept configuration changes
-        
-        Returns:
-            tuple[bool, str]: (is_ready, reason)
-        """
-        try:
-            # Check if basic initialization is complete
-            if not hasattr(self, 'valves') or self.valves is None:
-                return False, "System not yet initialized"
-            
-            # Check if we're in the middle of a critical operation
-            if hasattr(self, '_configuration_save_lock') and self._configuration_save_lock.locked():
-                return False, "Configuration save already in progress"
-            
-            # Check if background tasks are causing issues
-            if hasattr(self, '_error_counter'):
-                recent_errors = sum(1 for _, ts in self._error_counter.items() 
-                                  if (datetime.now(timezone.utc) - ts).total_seconds() < 60)
-                if recent_errors > 10:
-                    return False, "System experiencing high error rate, please wait"
-            
-            return True, "System ready for configuration update"
-            
-        except Exception as e:
-            logger.error(f"Error checking system readiness: {e}")
-            return False, f"System readiness check failed: {str(e)}"
+        if not hasattr(self, 'valves') or self.valves is None:
+            return False, "System not initialized"
+        if hasattr(self, '_configuration_save_lock') and self._configuration_save_lock.locked():
+            return False, "Save in progress"
+        return True, "Ready"
     
-    async def _save_configuration_safe(self, new_config: Dict[str, Any], timeout_seconds: int = 30) -> tuple[bool, str]:
-        """
-        Safely save configuration with timeout and error handling
-        
-        Args:
-            new_config: New configuration dictionary
-            timeout_seconds: Maximum time to wait for save operation
-            
-        Returns:
-            tuple[bool, str]: (success, message)
-        """
-        import asyncio
-        
-        async def _do_save():
-            try:
-                # Validate before save
-                is_valid, validation_message = self._validate_configuration_save(new_config)
-                if not is_valid:
-                    return False, f"Validation failed: {validation_message}"
-                
-                # Create backup of current configuration
-                current_config_backup = None
-                if hasattr(self, 'valves') and self.valves:
-                    try:
-                        current_config_backup = self.valves.model_dump()
-                    except Exception:
-                        current_config_backup = None
-                
-                # Apply new configuration
-                self.valves = self.Valves(**new_config)
-                
-                # Update self.config if it exists (for OpenWebUI persistence)
-                if hasattr(self, 'config') and isinstance(self.config, dict):
-                    self.config['valves'] = new_config
-                
-                # Validate post-save
-                if not self._validate_configuration_integrity(self.valves):
-                    # Restore backup if validation fails
-                    if current_config_backup:
-                        self.valves = self.Valves(**current_config_backup)
-                        if hasattr(self, 'config') and isinstance(self.config, dict):
-                            self.config['valves'] = current_config_backup
-                    return False, "Post-save validation failed, configuration restored"
-                
-                # Persist state for debugging
-                self._persist_configuration_state()
-                
-                return True, "Configuration saved successfully"
-                
-            except Exception as e:
-                # Attempt to restore backup on error
-                if current_config_backup:
-                    try:
-                        self.valves = self.Valves(**current_config_backup)
-                        if hasattr(self, 'config') and isinstance(self.config, dict):
-                            self.config['valves'] = current_config_backup
-                    except Exception as restore_error:
-                        logger.error(f"Failed to restore configuration backup: {restore_error}")
-                
-                return False, f"Save operation failed: {str(e)}"
-        
+    async def _save_configuration_safe(self, new_config: Dict[str, Any]) -> tuple[bool, str]:
         try:
-            # Execute save with timeout
-            result = await asyncio.wait_for(_do_save(), timeout=timeout_seconds)
-            return result
-        except asyncio.TimeoutError:
-            return False, f"Configuration save operation timed out after {timeout_seconds} seconds"
+            is_valid, msg = self._validate_configuration_save(new_config)
+            if not is_valid:
+                return False, msg
+            backup = self.valves.model_dump() if hasattr(self.valves, 'model_dump') else None
+            self.valves = self.Valves(**new_config)
+            self.config['valves'] = new_config
+            if not self._validate_configuration_integrity(self.valves):
+                if backup:
+                    self.valves = self.Valves(**backup)
+                    self.config['valves'] = backup
+                return False, "Validation failed"
+            return True, "Saved"
         except Exception as e:
-            return False, f"Configuration save operation error: {str(e)}"
+            return False, str(e)
     
     def set_valves(self, valves_data: Dict[str, Any]) -> bool:
-        """
-        Set new valves configuration (called by OpenWebUI when user saves settings)
-        
-        Args:
-            valves_data: New configuration data from OpenWebUI UI
-            
-        Returns:
-            bool: True if configuration was saved successfully
-        """
         try:
-            logger.info("Received new valves configuration from OpenWebUI")
-            
-            # Check if system is ready for configuration changes
-            is_ready, readiness_message = self._is_system_ready_for_config_save()
-            if not is_ready:
-                logger.error(f"System not ready for configuration save: {readiness_message}")
+            if not self._is_system_ready_for_config_save()[0]:
                 return False
-            
-            # Validate configuration synchronously for quick feedback
-            is_valid, validation_message = self._validate_configuration_save(valves_data)
-            if not is_valid:
-                logger.error(f"Configuration validation failed: {validation_message}")
+            if not self._validate_configuration_save(valves_data)[0]:
                 return False
-            
-            # Create backup
-            current_config_backup = None
-            if hasattr(self, 'valves') and self.valves:
-                try:
-                    current_config_backup = self.valves.model_dump()
-                except Exception:
-                    current_config_backup = None
-            
-            # Apply new configuration
+            backup = self.valves.model_dump() if hasattr(self.valves, 'model_dump') else None
             self.valves = self.Valves(**valves_data)
-            
-            # Update self.config for persistence
-            if hasattr(self, 'config') and isinstance(self.config, dict):
-                self.config['valves'] = valves_data
-            
-            # Final validation
+            self.config['valves'] = valves_data
             if not self._validate_configuration_integrity(self.valves):
-                # Restore backup if validation fails
-                if current_config_backup:
-                    self.valves = self.Valves(**current_config_backup)
-                    if hasattr(self, 'config') and isinstance(self.config, dict):
-                        self.config['valves'] = current_config_backup
-                logger.error("Post-save validation failed, configuration restored")
+                if backup:
+                    self.valves = self.Valves(**backup)
+                    self.config['valves'] = backup
                 return False
-            
-            # Persist state
-            self._persist_configuration_state()
-            logger.info("Configuration saved successfully via set_valves")
             return True
-            
-        except Exception as e:
-            logger.error(f"Error in set_valves: {e}")
-            # Attempt to restore backup
-            if current_config_backup:
-                try:
-                    self.valves = self.Valves(**current_config_backup)
-                    if hasattr(self, 'config') and isinstance(self.config, dict):
-                        self.config['valves'] = current_config_backup
-                except Exception as restore_error:
-                    logger.error(f"Failed to restore configuration backup: {restore_error}")
+        except:
             return False
     
     async def async_set_valves(self, valves_data: Dict[str, Any]) -> tuple[bool, str]:
-        """
-        Async version of set_valves with timeout protection and retry logic
-        
-        Args:
-            valves_data: New configuration data from OpenWebUI UI
-            
-        Returns:
-            tuple[bool, str]: (success, message)
-        """
-        if not self._configuration_save_lock:
-            # Fallback to sync version if no lock available
-            success = self.set_valves(valves_data)
-            return success, "Configuration saved" if success else "Configuration save failed"
-        
         async with self._configuration_save_lock:
-            try:
-                # Use the existing async save method with retry logic
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        success, message = await self._save_configuration_safe(
-                            valves_data, 
-                            timeout_seconds=15  # Shorter timeout for UI responsiveness
-                        )
-                        
-                        if success:
-                            logger.info(f"Configuration saved successfully on attempt {attempt + 1}")
-                            return True, message
-                        else:
-                            logger.warning(f"Save attempt {attempt + 1} failed: {message}")
-                            if attempt < max_retries - 1:
-                                # Wait before retry (exponential backoff)
-                                await asyncio.sleep(2 ** attempt)
-                    
-                    except Exception as e:
-                        logger.error(f"Save attempt {attempt + 1} error: {e}")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(2 ** attempt)
-                
-                return False, f"Configuration save failed after {max_retries} attempts"
-                
-            except Exception as e:
-                logger.error(f"Critical error in async_set_valves: {e}")
-                return False, f"Critical configuration save error: {str(e)}"
+            for attempt in range(3):
+                success, msg = await self._save_configuration_safe(valves_data)
+                if success:
+                    return True, msg
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+            return False, "Failed after 3 attempts"
     
-    async def _emit_configuration_status(
-        self, 
-        event_emitter: Optional[Callable[[Any], Awaitable[None]]], 
-        message: str, 
-        status_type: str = "info",
-        done: bool = False
-    ) -> None:
-        """
-        Emit configuration status message to user interface
-        
-        Args:
-            event_emitter: Event emitter function
-            message: Status message to display
-            status_type: Type of status (info, error, warning)
-            done: Whether operation is complete
-        """
+    async def _emit_configuration_status(self, event_emitter, message: str, done: bool = False):
         if event_emitter:
-            try:
-                await self._safe_emit(event_emitter, {
-                    "type": "status",
-                    "data": {
-                        "description": message,
-                        "done": done,
-                    }
-                })
-            except Exception as e:
-                logger.error(f"Failed to emit configuration status: {e}")
+            await self._safe_emit(event_emitter, {"type": "status", "data": {"description": message, "done": done}})
     
     def validate_configuration_before_ui_save(self, new_config: Dict[str, Any]) -> tuple[bool, str]:
-        """
-        Quick validation method that can be called synchronously before UI save
-        This helps prevent the infinite spinner by failing fast on invalid config
-        
-        Args:
-            new_config: New configuration to validate
-            
-        Returns:
-            tuple[bool, str]: (is_valid, message)
-        """
         try:
-            # Check system readiness first
-            is_ready, readiness_message = self._is_system_ready_for_config_save()
-            if not is_ready:
-                return False, f"System not ready: {readiness_message}"
-            
-            # Quick validation of critical fields
-            try:
-                test_valves = self.Valves(**new_config)
-            except Exception as e:
-                return False, f"Configuration format error: {str(e)}"
-            
-            # Check for critical configuration errors that would cause problems
-            critical_fields = {
-                'vector_similarity_threshold': (lambda x: 0.0 <= x <= 1.0, "must be between 0.0 and 1.0"),
-                'relevance_threshold': (lambda x: 0.0 <= x <= 1.0, "must be between 0.0 and 1.0"),
-                'llm_api_endpoint_url': (lambda x: x and (x.startswith('http://') or x.startswith('https://')), "must be a valid HTTP URL"),
-                'max_total_memories': (lambda x: isinstance(x, int) and x > 0, "must be a positive integer"),
-            }
-            
-            for field, (validator, error_msg) in critical_fields.items():
-                if hasattr(test_valves, field):
-                    value = getattr(test_valves, field)
-                    if not validator(value):
-                        return False, f"Field '{field}' {error_msg}, got: {value}"
-            
-            return True, "Configuration validation passed"
-            
+            if not self._is_system_ready_for_config_save()[0]:
+                return False, "System not ready"
+            self.Valves(**new_config)
+            return True, "Valid"
         except Exception as e:
-            return False, f"Validation error: {str(e)}"
+            return False, str(e)
     
     def _reload_configuration_safe(self, force_reload=False) -> bool:
-        """Safely reload configuration from self.config with validation"""
         try:
-            # Store current configuration as backup
-            current_valves_backup = None
-            try:
-                current_valves_backup = self.valves.model_copy() if hasattr(self.valves, 'model_copy') else self.valves
-            except Exception:
-                pass
-            
-            # Load fresh configuration data
-            loaded_config_data = self._load_configuration_safe()
-            
-            # Only reload if we have new data or if forced
-            if not loaded_config_data and not force_reload:
-                logger.debug("No configuration data to reload and not forced, keeping current config")
+            data = self._load_configuration_safe()
+            if not data and not force_reload:
                 return True
-            
-            # Create new valves instance with loaded data
-            new_valves = self.Valves(**loaded_config_data)
-            
-            # Validate new configuration
-            if not self._validate_configuration_integrity(new_valves):
-                logger.warning("Reloaded configuration failed integrity check, keeping current config")
-                return False
-            
-            # Apply new configuration
-            self.valves = new_valves
-            logger.info("Successfully reloaded configuration")
-            
-            # Persist state for debugging
-            self._persist_configuration_state()
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error during configuration reload: {e}")
-            
-            # Try to restore backup if available
-            if current_valves_backup:
-                try:
-                    self.valves = current_valves_backup
-                    logger.info("Restored previous configuration after reload failure")
-                except Exception as restore_error:
-                    logger.error(f"Failed to restore backup configuration: {restore_error}")
-            
+            self.valves = self.Valves(**data)
+            return self._validate_configuration_integrity(self.valves)
+        except:
             return False
     
     def _ensure_configuration_persistence(self):
-        """Ensure configuration values persist correctly across operations"""
-        try:
-            # Check if critical values have been reset unexpectedly
-            if not hasattr(self, 'valves') or not self.valves:
-                logger.warning("Valves object missing, recovering")
-                return self._recover_configuration("missing_valves")
-            
-            # Validate current configuration
-            if not self._validate_configuration_integrity(self.valves):
-                logger.warning("Configuration corruption detected during persistence check")
-                return self._reload_configuration_safe(force_reload=True)
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error during configuration persistence check: {e}")
-            return False
+        if not hasattr(self, 'valves') or not self.valves:
+            return self._recover_configuration()
+        if not self._validate_configuration_integrity(self.valves):
+            return self._reload_configuration_safe(True)
+        return True
     
     def _test_configuration_management(self):
-        """Test configuration management functionality - for debugging"""
-        try:
-            logger.info("=== Configuration Management Test ===")
-            
-            # Test 1: Current configuration state
-            logger.info(f"Current valves type: {type(self.valves)}")
-            logger.info(f"Current allowed_memory_banks: {getattr(self.valves, 'allowed_memory_banks', 'NOT_SET')}")
-            logger.info(f"Current vector_similarity_threshold: {getattr(self.valves, 'vector_similarity_threshold', 'NOT_SET')}")
-            
-            # Test 2: Configuration integrity
-            integrity_result = self._validate_configuration_integrity(self.valves)
-            logger.info(f"Configuration integrity check: {'PASSED' if integrity_result else 'FAILED'}")
-            
-            # Test 3: Configuration persistence
-            persistence_result = self._ensure_configuration_persistence()
-            logger.info(f"Configuration persistence check: {'PASSED' if persistence_result else 'FAILED'}")
-            
-            # Test 4: Configuration serialization
-            try:
-                serialized = self.valves.model_dump() if hasattr(self.valves, 'model_dump') else "NO_DUMP_METHOD"
-                logger.info(f"Configuration serialization: {'SUCCESS' if serialized != 'NO_DUMP_METHOD' else 'FAILED'}")
-            except Exception as e:
-                logger.info(f"Configuration serialization: FAILED - {e}")
-            
-            logger.info("=== Configuration Management Test Complete ===")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Configuration management test failed: {e}")
-            return False
+        return self._validate_configuration_integrity(self.valves) and self._ensure_configuration_persistence()
 
     def __init__(self):
-        """Initialize filter and schedule background tasks"""
-        self.config: Dict[str, Any] = {}
+        self.config = {}
         self._configuration_save_lock = asyncio.Lock()
-        
-        # --- Robust Configuration Loading ---
         try:
-            # Load configuration with error handling
-            loaded_config_data = self._load_configuration_safe()
-            
-            # Initialize valves with loaded config and Pydantic validation
-            self.valves = self.Valves(**loaded_config_data)
-            logger.info("Successfully initialized self.valves using loaded config and Pydantic validation.")
-            
-            # Validate configuration integrity
+            self.valves = self.Valves(**self._load_configuration_safe())
             if not self._validate_configuration_integrity(self.valves):
-                logger.warning("Configuration integrity check failed, attempting recovery")
-                if not self._recover_configuration("integrity_check_failed"):
-                    raise ValueError("Configuration recovery failed")
-            
-            # Persist current state for debugging
-            self._persist_configuration_state()
-            
-        except Exception as e:
-            logger.error(f"Error initializing valves configuration: {e}\n{traceback.format_exc()}")
-            
-            # Attempt recovery
-            if not self._recover_configuration(f"initialization_error: {str(e)}"):
-                # Last resort: create minimal working configuration
-                logger.error("All configuration recovery attempts failed, using minimal config")
-                self.valves = self.Valves()
-        
-        # --- End robust configuration loading ---
+                self._recover_configuration()
+        except:
+            self.valves = self.Valves()
 
         self.stored_memories = None
         self._error_message = None # Stores the reason for the last failure (e.g., json_parse_error)
         self._aiohttp_session = None
 
-        # --- Added initialisations to prevent AttributeError ---
-        # Track already-processed user messages to avoid duplicate extraction
-        self._processed_messages: Set[str] = set()
-        # Simple metrics counter dictionary
-        self.metrics: Dict[str, int] = {"llm_call_count": 0}
-        # Hold last processed body for confirmation tagging
-        self._last_body: Dict[str, Any] = {}
-        
-        # Connection management and circuit breaker state
-        self._circuit_breaker_state = {}  # Per-endpoint circuit breaker state
-        self._connection_health = {}  # Per-endpoint health status
-        self._last_health_check = {}  # Last health check timestamp
-        self._session_connector = None  # Shared connector for connection pooling
-
-        # Background tasks tracking
+        self._processed_messages = set()
+        self.metrics = {"llm_call_count": 0}
+        self._last_body = {}
+        self._circuit_breaker_state = {}
+        self._connection_health = {}
+        self._last_health_check = {}
+        self._session_connector = None
         self._background_tasks = set()
+        self.error_counters = {"embedding_errors": 0, "llm_call_errors": 0, "json_parse_errors": 0, "memory_crud_errors": 0}
 
-        # Error counters
-        self.error_counters = {
-            "embedding_errors": 0,
-            "llm_call_errors": 0,
-            "json_parse_errors": 0,
-            "memory_crud_errors": 0,
-        }
-        
-        # Log configuration for deduplication, helpful for testing and validation
-        logger.debug(f"Memory deduplication settings:")
-        logger.debug(f"  - deduplicate_memories: {self.valves.deduplicate_memories}")
-        logger.debug(f"  - use_embeddings_for_deduplication: {self.valves.use_embeddings_for_deduplication}")
-        logger.debug(f"  - similarity_threshold: {self.valves.similarity_threshold}")
-
-        # Schedule background tasks based on configuration valves
         if self.valves.enable_error_logging_task:
-            self._error_log_task = asyncio.create_task(self._log_error_counters_loop())
-            self._background_tasks.add(self._error_log_task)
-            self._error_log_task.add_done_callback(self._background_tasks.discard)
-            logger.debug("Started error logging background task")
-
+            self._add_background_task(self._log_error_counters_loop())
         if self.valves.enable_summarization_task:
-            self._summarization_task = asyncio.create_task(
-                self._summarize_old_memories_loop()
-            )
-            self._background_tasks.add(self._summarization_task)
-            self._summarization_task.add_done_callback(self._background_tasks.discard)
-            logger.debug("Started memory summarization background task")
+            self._add_background_task(self._summarize_old_memories_loop())
 
-        # Model discovery results
         self.available_ollama_models = []
         self.available_openai_models = []
-        # NEW: store locally available SentenceTransformer models
         self.available_local_embedding_models = []
-
-        # Add current date awareness for prompts
         self.current_date = datetime.now()
         self.date_info = self._update_date_info()
-
-        # Schedule date update task if enabled
         if self.valves.enable_date_update_task:
-            self._date_update_task = self._schedule_date_update()
-            logger.debug("Scheduled date update background task")
-        else:
-            self._date_update_task = None
-
-        # Schedule model discovery task if enabled
+            self._add_background_task(self._update_date_loop())
         if self.valves.enable_model_discovery_task:
-            self._model_discovery_task = self._schedule_model_discovery()
-            logger.debug("Scheduled model discovery background task")
-        else:
-            self._model_discovery_task = None
-
-        # Initialize MiniLM embedding model (singleton)
-        # self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2") # Removed: Property handles lazy init
-
-        # In-memory store: memory_id -> embedding vector (np.array)
+            self._add_background_task(self._discover_models_loop())
         self._memory_embeddings = {}
-
-        # In-memory cache: (hash of user_emb + mem_emb) -> (score, timestamp)
         self._relevance_cache = {}
 
-        # Error counter tracking for guard mechanism (Point 8)
+        # Initialize JSON repair system
+        if JSON_REPAIR_AVAILABLE:
+            self._json_parser = EnhancedJSONParser()
+            logger.info("JSON repair system initialized")
+        else:
+            self._json_parser = None
+            logger.warning("JSON repair system not available, using basic parsing")
+
         from collections import deque
-        self.error_timestamps = {
-            "json_parse_errors": deque(),
-            # Add other error types here if needed for guarding
-        }
+        self.error_timestamps = {"json_parse_errors": deque()}
         self._guard_active = False
         self._guard_activated_at = 0
-
-        # Initialize duplicate counters (used in process_memories)
         self._duplicate_skipped = 0
         self._duplicate_refreshed = 0
+        self._llm_feature_guard_active = False
+        self._embedding_feature_guard_active = False
+        self._background_tasks_started = False
 
-        # ------------------------------------------------------------
-        # Guard/feature-flag initialisation (missing previously)
-        # These flags can be toggled elsewhere in the codebase to
-        # temporarily disable LLM-dependent or embedding-dependent
-        # functionality when error thresholds are exceeded.
-        # ------------------------------------------------------------
-        self._llm_feature_guard_active: bool = False
-        self._embedding_feature_guard_active: bool = False
-
-        # Track that background tasks are not yet re-initialised via inlet()
-        self._background_tasks_started: bool = False
-
-        # -----------------------------------------------------------
-        # Filter Orchestration System Initialization
-        # -----------------------------------------------------------
         if self.valves.enable_filter_orchestration:
             self._initialize_filter_orchestration()
-            # Add API endpoints for orchestration
-            self._register_orchestration_endpoints()
         else:
             self._orchestration_context = None
             self._filter_metadata = None
             self._rollback_stack = []
 
     def _initialize_filter_orchestration(self):
-        """Initialize filter orchestration and register with the system"""
         try:
-            # Create filter metadata
-            self._filter_metadata = FilterMetadata(
-                name="adaptive_memory",
-                version="4.0",
-                description="Provides persistent, personalized memory capabilities for LLMs with dynamic extraction, filtering, storage, and retrieval",
-                capabilities=[
-                    FilterCapability.MEMORY_EXTRACTION,
-                    FilterCapability.MEMORY_INJECTION,
-                    FilterCapability.CONTENT_ANALYSIS,
-                    FilterCapability.USER_PROFILING,
-                    FilterCapability.CONTEXT_ENHANCEMENT,
-                    FilterCapability.CONVERSATION_TRACKING
-                ],
-                operations=[
-                    FilterOperation.CONTENT_MODIFICATION,
-                    FilterOperation.METADATA_ADDITION,
-                    FilterOperation.MEMORY_OPERATION,
-                    FilterOperation.CONTEXT_INJECTION
-                ],
-                priority=FilterPriority[self.valves.filter_priority.upper()],
-                dependencies=[],  # No dependencies currently
-                conflicts_with=[],  # No known conflicts currently
-                max_execution_time_ms=self.valves.filter_execution_timeout_ms,
-                memory_requirements_mb=100,  # Estimate based on embedding models and cache
-                requires_user_context=True,
-                modifies_content=True,
-                thread_safe=True
-            )
-            
-            # Register with orchestration manager
-            if _orchestration_manager.register_filter(self._filter_metadata):
-                logger.info("Successfully registered adaptive_memory filter with orchestration system")
-            else:
-                logger.warning("Failed to register with orchestration system, continuing without coordination")
-            
-            # Initialize orchestration state
+            self._filter_metadata = FilterMetadata(name="adaptive_memory", version="4.0", priority=FilterPriority[self.valves.filter_priority.upper()])
+            self._orchestration_manager = SimpleOrchestrator()
             self._orchestration_context = None
             self._rollback_stack = []
             self._operation_lock = threading.RLock()
             self._state_snapshot = {}
-            
-            logger.debug("Filter orchestration system initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize filter orchestration: {e}")
-            # Continue without orchestration
+        except:
             self._orchestration_context = None
             self._filter_metadata = None
             self._rollback_stack = []
 
-    def _create_execution_context(self, user_id: Optional[str] = None) -> Optional[FilterExecutionContext]:
-        """Create or get execution context for this operation"""
-        if not self.valves.enable_filter_orchestration or not self._filter_metadata:
-            return None
-        
-        try:
-            context = _orchestration_manager.create_execution_context(user_id)
-            context.filter_chain.append("adaptive_memory")
-            return context
-        except Exception as e:
-            logger.error(f"Failed to create execution context: {e}")
-            return None
+    def _create_execution_context(self, user_id=None):
+        return None
 
-    def _record_operation_start(self, operation: str, context: Optional[FilterExecutionContext] = None):
-        """Record the start of a filter operation"""
+    def _record_operation_start(self, operation, context=None):
         if not self.valves.enable_performance_monitoring:
             return
-        
-        try:
-            FILTER_EXECUTIONS.labels(operation=operation, status="started").inc()
-            
-            if context:
-                context.performance_metrics[f"{operation}_start_time"] = time.time()
-            
-        except Exception as e:
-            logger.debug(f"Failed to record operation start: {e}")
+        self._operation_start_time = time.time()
 
-    def _record_operation_success(self, operation: str, start_time: float, context: Optional[FilterExecutionContext] = None):
-        """Record successful completion of a filter operation"""
+    def _record_operation_success(self, operation, start_time, context=None):
         if not self.valves.enable_performance_monitoring:
             return
-        
         try:
-            execution_time = (time.time() - start_time) * 1000  # Convert to ms
-            
-            FILTER_EXECUTIONS.labels(operation=operation, status="success").inc()
-            FILTER_LATENCY.labels(operation=operation).observe(execution_time / 1000)  # Histogram expects seconds
-            
-            _orchestration_manager.record_performance("adaptive_memory", execution_time)
-            
-            if context:
-                context.performance_metrics[f"{operation}_execution_time_ms"] = execution_time
-            
-        except Exception as e:
-            logger.debug(f"Failed to record operation success: {e}")
+            execution_time = (time.time() - start_time) * 1000
+            if hasattr(self, '_orchestration_manager'):
+                self._orchestration_manager.record_performance(execution_time)
+        except:
+            pass
 
-    def _record_operation_failure(self, operation: str, start_time: float, error: str, context: Optional[FilterExecutionContext] = None):
-        """Record failed completion of a filter operation"""
+    def _record_operation_failure(self, operation, start_time, error, context=None):
         if not self.valves.enable_performance_monitoring:
             return
-        
         try:
-            execution_time = (time.time() - start_time) * 1000  # Convert to ms
-            
-            FILTER_EXECUTIONS.labels(operation=operation, status="error").inc()
-            FILTER_LATENCY.labels(operation=operation).observe(execution_time / 1000)
-            
-            if context:
-                context.performance_metrics[f"{operation}_execution_time_ms"] = execution_time
-                context.performance_metrics[f"{operation}_error"] = error
-            
-        except Exception as e:
-            logger.debug(f"Failed to record operation failure: {e}")
+            execution_time = (time.time() - start_time) * 1000
+            logger.warning(f"Operation {operation} failed after {execution_time}ms: {error}")
+        except:
+            pass
 
     def _create_rollback_point(self, operation: str, data: Dict[str, Any]):
-        """Create a rollback point for the current operation"""
         if not self.valves.enable_rollback_mechanism:
             return
-        
         try:
-            rollback_entry = {
-                "operation": operation,
-                "timestamp": time.time(),
-                "data": copy.deepcopy(data),
-                "rollback_id": str(uuid.uuid4())
-            }
-            self._rollback_stack.append(rollback_entry)
-            
-            # Keep only last 10 rollback points to prevent memory bloat
+            self._rollback_stack.append({"operation": operation, "timestamp": time.time(), "data": copy.deepcopy(data), "rollback_id": str(uuid.uuid4())})
             if len(self._rollback_stack) > 10:
                 self._rollback_stack.pop(0)
-                
-        except Exception as e:
-            logger.debug(f"Failed to create rollback point: {e}")
+        except:
+            pass
+
+    def _add_background_task(self, coro):
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     def _perform_rollback(self, rollback_id: Optional[str] = None) -> bool:
         """Perform rollback to a previous state"""
@@ -3014,7 +761,6 @@ Your output must be valid JSON only. No additional text.""",
             else:
                 processed_ids.add(mem.get("id")) # Mark young memories as processed
         
-        logger.debug(f"Summarization: Found {len(eligible_memories)} memories older than {min_age_days} days.")
 
         if not eligible_memories:
             return []
@@ -3022,7 +768,6 @@ Your output must be valid JSON only. No additional text.""",
         # --- Embedding Clustering --- (Only if strategy is 'embeddings' or 'hybrid')
         embedding_clusters = []
         if strategy in ["embeddings", "hybrid"] and self._local_embedding_model:
-            logger.debug(f"Clustering eligible memories using embeddings (threshold: {threshold})...")
             # Ensure all eligible memories have embeddings
             for mem in eligible_memories:
                 mem_id = mem.get("id")
@@ -3082,8 +827,6 @@ Your output must be valid JSON only. No additional text.""",
                 
                 if len(cluster) >= self.valves.summarization_min_cluster_size:
                     embedding_clusters.append(cluster)
-                    logger.debug(f"Found embedding cluster of size {len(cluster)} starting with ID {current_id}")
-            logger.debug(f"Identified {len(embedding_clusters)} potential clusters via embeddings.")
             # If strategy is only embeddings, return now
             if strategy == "embeddings":
                  return embedding_clusters
@@ -3091,7 +834,6 @@ Your output must be valid JSON only. No additional text.""",
         # --- Tag Clustering --- (Only if strategy is 'tags' or 'hybrid')
         tag_clusters = []
         if strategy in ["tags", "hybrid"]:
-            logger.debug(f"Clustering eligible memories using tags...")
             from collections import defaultdict
             tag_map = defaultdict(list)
             
@@ -3119,15 +861,12 @@ Your output must be valid JSON only. No additional text.""",
                     # Mark these IDs as processed for hybrid mode
                     for mem in current_cluster:
                         processed_ids.add(mem.get("id"))
-                    logger.debug(f"Found tag cluster of size {len(current_cluster)} based on tags: {[t for t,mems in tag_map.items() if candidate[0] in mems]}")
-            logger.debug(f"Identified {len(tag_clusters)} potential clusters via tags.")
             if strategy == "tags":
                  return tag_clusters
         
         # --- Hybrid Strategy: Combine and return --- 
         if strategy == "hybrid":
              # Simply concatenate the lists of clusters found by each method
-             logger.debug(f"Combining {len(embedding_clusters)} embedding clusters and {len(tag_clusters)} tag clusters for hybrid strategy.")
              all_clusters = embedding_clusters + tag_clusters
              return all_clusters
         
@@ -3135,200 +874,111 @@ Your output must be valid JSON only. No additional text.""",
         return []
 
     async def _summarize_old_memories_loop(self):
-        """Periodically summarize old memories into concise summaries"""
-        try:
-            while True:
-                # Use configurable interval with small random jitter to prevent thundering herd
-                jitter = random.uniform(0.9, 1.1)  # ±10% randomization
-                interval = self.valves.summarization_interval * jitter
-                await asyncio.sleep(interval)
-                logger.info("Starting periodic memory summarization run...")
-                
-                try:
-                    # Fetch all users (or handle single user case)
-                    # For now, assuming single user for simplicity, adapt if multi-user support needed
-                    user_id = "default" # Replace with actual user ID logic if needed
-                    user_obj = Users.get_user_by_id(user_id)
-                    if not user_obj:
-                        logger.warning(f"Summarization skipped: User '{user_id}' not found.")
-                        continue
-                    
-                    # Get all memories for the user
-                    all_user_memories = await self._get_formatted_memories(user_id)
-                    if len(all_user_memories) < self.valves.summarization_min_cluster_size:
-                         logger.info(f"Summarization skipped: Not enough memories for user '{user_id}' to form a cluster.")
-                         continue
+        while True:
+            try:
+                await asyncio.sleep(self.valves.summarization_interval * random.uniform(0.9, 1.1))
+                user_id = "default"
+                user_obj = Users.get_user_by_id(user_id)
+                if not user_obj:
+                    continue
+                all_user_memories = await self._get_formatted_memories(user_id)
+                if len(all_user_memories) < self.valves.summarization_min_cluster_size:
+                    continue
                          
-                    logger.debug(f"Retrieved {len(all_user_memories)} total memories for user '{user_id}' for summarization.")
-                    
-                    # Find clusters of related, old memories
-                    memory_clusters = await self._find_memory_clusters(all_user_memories)
-                    
-                    if not memory_clusters:
-                        logger.info(f"No eligible memory clusters found for user '{user_id}' for summarization.")
-                        continue
-                    
-                    logger.info(f"Found {len(memory_clusters)} memory clusters to potentially summarize for user '{user_id}'.")
-                    
-                    # Process each cluster
-                    summarized_count = 0
-                    deleted_count = 0
-                    for cluster in memory_clusters:
-                        # Ensure cluster still meets minimum size after potential filtering in _find_memory_clusters
+                memory_clusters = await self._find_memory_clusters(all_user_memories)
+                if not memory_clusters:
+                    continue
+                summarized_count = 0
+                deleted_count = 0
+                for cluster in memory_clusters:
                         if len(cluster) < self.valves.summarization_min_cluster_size:
                             continue
-                        
-                        # Limit cluster size for the LLM call
                         cluster_to_summarize = cluster[:self.valves.summarization_max_cluster_size]
-                        logger.debug(f"Attempting to summarize cluster of size {len(cluster_to_summarize)} (max: {self.valves.summarization_max_cluster_size}).")
-
-                        # Extract memory texts for the LLM prompt
-                        mem_texts = [m.get("memory", "") for m in cluster_to_summarize]
-                        # Sort by date to help LLM resolve contradictions potentially
                         cluster_to_summarize.sort(key=lambda m: m.get("created_at", datetime.min.replace(tzinfo=timezone.utc)))
                         combined_text = "\n- ".join([m.get("memory", "") for m in cluster_to_summarize])
 
-                        # Use the new configurable summarization prompt
-                        system_prompt = self.valves.summarization_memory_prompt
-                        user_prompt = f"Related memories to summarize:\n- {combined_text}"
-
-                        logger.debug(f"Calling LLM to summarize cluster. System prompt length: {len(system_prompt)}, User prompt length: {len(user_prompt)}")
-                        summary = await self.query_llm_with_retry(system_prompt, user_prompt)
-
-                        if summary and not summary.startswith("Error:"):                            
-                            # Format summary with tags (e.g., from the first memory in cluster? Or generate new ones?)
-                            # For simplicity, let's try inheriting tags from the *first* memory in the sorted cluster
+                        summary = await self.query_llm_with_retry(self.valves.summarization_memory_prompt, f"Related memories to summarize:\n- {combined_text}")
+                        if summary and not summary.startswith("Error:"):
                             first_mem_content = cluster_to_summarize[0].get("memory", "")
                             tags = []
                             tags_match = re.match(r"\[Tags: (.*?)\]", first_mem_content)
                             if tags_match:
                                 tags = [tag.strip() for tag in tags_match.group(1).split(",")]
-                            
-                            # Add a specific "summarized" tag
                             if "summarized" not in tags:
                                 tags.append("summarized")
-                                
                             formatted_summary = f"[Tags: {', '.join(tags)}] {summary.strip()}"
-                            
-                            logger.info(f"Generated summary for cluster: {formatted_summary[:100]}...")
-                            
-                            # Save summary as new memory
                             try:
-                                new_mem_op = MemoryOperation(operation="NEW", content=formatted_summary, tags=tags)
-                                await self._execute_memory_operation(new_mem_op, user_obj)
+                                await self._execute_memory_operation(MemoryOperation(operation="NEW", content=formatted_summary, tags=tags), user_obj)
                                 summarized_count += 1
-                            except Exception as add_err:
-                                logger.error(f"Failed to save summary memory: {add_err}")
-                                continue # Skip deleting originals if saving summary fails
-                            
-                            # Delete original memories in the summarized cluster
-                            for mem_to_delete in cluster_to_summarize:
+                            except:
+                                continue
+                            for mem in cluster_to_summarize:
                                 try:
-                                    delete_op = MemoryOperation(operation="DELETE", id=mem_to_delete["id"])
-                                    await self._execute_memory_operation(delete_op, user_obj)
+                                    await self._execute_memory_operation(MemoryOperation(operation="DELETE", id=mem["id"]), user_obj)
                                     deleted_count += 1
-                                except Exception as del_err:
-                                    logger.warning(f"Failed to delete old memory {mem_to_delete.get('id')} during summarization: {del_err}")
-                                    # Continue deleting others even if one fails
-                            logger.debug(f"Deleted {deleted_count} original memories after summarization.")
-                        else:
-                            logger.warning(f"LLM failed to generate summary for cluster starting with ID {cluster_to_summarize[0].get('id')}. Response: {summary}")
-
-                    if summarized_count > 0:
-                        logger.info(f"Successfully generated {summarized_count} summaries and deleted {deleted_count} original memories for user '{user_id}'.")
-                    else:
-                        logger.info(f"No summaries were generated in this run for user '{user_id}'.")
-                        
-                except Exception as e:
-                    logger.error(f"Error in summarization loop for a user: {e}\n{traceback.format_exc()}")
-                    # Continue loop even if one user fails
-        except asyncio.CancelledError:
-            logger.info("Memory summarization task cancelled.")
-        except Exception as e:
-            logger.error(f"Fatal error in summarization task loop: {e}\n{traceback.format_exc()}")
+                                except:
+                                    pass
+                if summarized_count > 0:
+                    logger.info(f"Generated {summarized_count} summaries, deleted {deleted_count} memories")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Summarization error: {e}")
 
     def _update_date_info(self):
-        """Update the date information dictionary with current time"""
-        return {
-            "iso_date": self.current_date.strftime("%Y-%m-%d"),
-            "year": self.current_date.year,
-            "month": self.current_date.strftime("%B"),
-            "day": self.current_date.day,
-            "weekday": self.current_date.strftime("%A"),
-            "hour": self.current_date.hour,
-            "minute": self.current_date.minute,
-            "iso_time": self.current_date.strftime("%H:%M:%S"),
-        }
+        d = self.current_date
+        return {"iso_date": d.strftime("%Y-%m-%d"), "year": d.year, "month": d.strftime("%B"), "day": d.day, "weekday": d.strftime("%A"), "hour": d.hour, "minute": d.minute, "iso_time": d.strftime("%H:%M:%S")}
+    
+    async def _update_date_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(self.valves.date_update_interval * random.uniform(0.9, 1.1))
+                self.current_date = self.get_formatted_datetime()
+                self.date_info = self._update_date_info()
+            except asyncio.CancelledError:
+                break
+            except:
+                pass
+    
+    async def _discover_models_loop(self):
+        while True:
+            try:
+                await self._discover_models()
+                await asyncio.sleep(self.valves.model_discovery_interval * random.uniform(0.9, 1.1))
+            except asyncio.CancelledError:
+                break
+            except:
+                await asyncio.sleep(self.valves.model_discovery_interval / 6)
 
     async def _log_error_counters_loop(self):
-        """Periodically log error counters"""
-        try:
-            while True:
-                # Use configurable interval with small random jitter
-                jitter = random.uniform(0.9, 1.1)  # ±10% randomization
-                interval = self.valves.error_logging_interval * jitter
-                await asyncio.sleep(interval)
-                
-                # Determine logging behaviour based on valve settings
-                if self.valves.debug_error_counter_logs:
-                    # Verbose debug logging – every interval
-                    logger.debug(f"Error counters: {self.error_counters}")
-                else:
-                    # Only log when at least one counter is non-zero to reduce clutter
-                    if any(count > 0 for count in self.error_counters.values()):
-                        logger.info(f"Error counters (non-zero): {self.error_counters}")
+        while True:
+            try:
+                await asyncio.sleep(self.valves.error_logging_interval * random.uniform(0.9, 1.1))
+                if self.valves.debug_error_counter_logs or any(self.error_counters.values()):
+                    logger.info(f"Error counters: {self.error_counters}")
 
-                # Point 8: Error Counter Guard Logic
                 if self.valves.enable_error_counter_guard:
                     now = time.time()
-                    window = self.valves.error_guard_window_seconds
-                    threshold = self.valves.error_guard_threshold
-
-                    # Check JSON parse errors
-                    error_type = "json_parse_errors"
-                    # Record current count as a timestamp
-                    current_count = self.error_counters[error_type]
-                    # --- NOTE: This simple approach assumes the counter *increases* to track new errors.
-                    # If the counter could be reset externally, a more robust timestamp queue is needed.
-                    # For simplicity, assuming monotonically increasing count for now.
-                    # A better approach: Store timestamp of each error occurrence.
-                    # Let's refine this: Add timestamp whenever the error counter increments.
-                    # We need to modify where the counter is incremented.
-
-                    # --- Revised approach: Use a deque to store timestamps of recent errors --- 
-                    timestamps = self.error_timestamps[error_type]
-                    
-                    # Remove old timestamps outside the window
-                    while timestamps and timestamps[0] < now - window:
+                    timestamps = self.error_timestamps["json_parse_errors"]
+                    while timestamps and timestamps[0] < now - self.valves.error_guard_window_seconds:
                         timestamps.popleft()
-
-                    # Check if the count within the window exceeds the threshold
-                    if len(timestamps) >= threshold:
+                    if len(timestamps) >= self.valves.error_guard_threshold:
                         if not self._guard_active:
-                            logger.warning(f"Guard Activated: {error_type} count ({len(timestamps)}) reached threshold ({threshold}) in window ({window}s). Temporarily disabling LLM relevance and embedding dedupe.")
                             self._guard_active = True
-                            self._guard_activated_at = now
-                            # Temporarily disable features
                             self._original_use_llm_relevance = self.valves.use_llm_for_relevance
                             self._original_use_embedding_dedupe = self.valves.use_embeddings_for_deduplication
                             self.valves.use_llm_for_relevance = False
                             self.valves.use_embeddings_for_deduplication = False
-                        elif self._guard_active:
-                            # Deactivate guard if error rate drops below threshold (with hysteresis?)
-                            # For simplicity, deactivate immediately when below threshold.
-                            logger.info(f"Guard Deactivated: {error_type} count ({len(timestamps)}) below threshold ({threshold}). Re-enabling LLM relevance and embedding dedupe.")
-                            self._guard_active = False
-                            # Restore original settings
-                            if hasattr(self, '_original_use_llm_relevance'):
-                                self.valves.use_llm_for_relevance = self._original_use_llm_relevance
-                            if hasattr(self, '_original_use_embedding_dedupe'):
-                                self.valves.use_embeddings_for_deduplication = self._original_use_embedding_dedupe
-        except asyncio.CancelledError:
-            logger.debug("Error counter logging task cancelled")
-        except Exception as e:
-            logger.error(
-                f"Error in error counter logging task: {e}\n{traceback.format_exc()}"
-            )
+                    elif self._guard_active:
+                        self._guard_active = False
+                        if hasattr(self, '_original_use_llm_relevance'):
+                            self.valves.use_llm_for_relevance = self._original_use_llm_relevance
+                        if hasattr(self, '_original_use_embedding_dedupe'):
+                            self.valves.use_embeddings_for_deduplication = self._original_use_embedding_dedupe
+            except asyncio.CancelledError:
+                break
+            except:
+                pass
 
     def _schedule_date_update(self):
         """Schedule a regular update of the date information"""
@@ -3343,9 +993,8 @@ Your output must be valid JSON only. No additional text.""",
                     
                     self.current_date = self.get_formatted_datetime()
                     self.date_info = self._update_date_info()
-                    logger.debug(f"Updated date information: {self.date_info}")
             except asyncio.CancelledError:
-                logger.debug("Date update task cancelled")
+                pass
             except Exception as e:
                 logger.error(f"Error in date update task: {e}")
 
@@ -3376,7 +1025,7 @@ Your output must be valid JSON only. No additional text.""",
                         # On error, retry sooner (1/6 of normal interval)
                         await asyncio.sleep(self.valves.model_discovery_interval / 6)
             except asyncio.CancelledError:
-                logger.debug("Model discovery task cancelled")
+                pass
 
         # Start the discovery loop in the background
         task = asyncio.create_task(discover_models_loop())
@@ -3385,204 +1034,99 @@ Your output must be valid JSON only. No additional text.""",
         return task
 
     async def _discover_models(self):
-        """Discover available models from open_webui.configured providers"""
-        logger.debug("Starting model discovery")
-
-        # Create a session if needed
         session = await self._get_aiohttp_session()
-
-        # Discover Ollama models with improved error handling
         try:
-            ollama_url = "http://host.docker.internal:11434/api/tags"
-            # Use a shorter timeout for model discovery as it's not critical
-            discovery_timeout = aiohttp.ClientTimeout(total=10)
-            async with session.get(ollama_url, timeout=discovery_timeout) as response:
+            async with session.get("http://host.docker.internal:11434/api/tags", timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
                     data = await response.json()
-                    if "models" in data:
-                        self.available_ollama_models = [
-                            model["name"] for model in data["models"]
-                        ]
-                    logger.debug(
-                        f"Discovered {len(self.available_ollama_models)} Ollama models"
-                    )
+                    self.available_ollama_models = [m["name"] for m in data.get("models", [])]
                 else:
-                    logger.warning(f"Ollama model discovery failed with status {response.status}")
                     self.available_ollama_models = []
-        except asyncio.TimeoutError:
-            logger.warning("Ollama model discovery timed out - Ollama may not be available")
+        except:
             self.available_ollama_models = []
-        except aiohttp.ClientError as e:
-            logger.warning(f"Network error during Ollama model discovery: {e}")
-            self.available_ollama_models = []
-        except Exception as e:
-            logger.warning(f"Unexpected error discovering Ollama models: {e}")
-            self.available_ollama_models = []
-
-        # ------------------------------------------------------------
-        # NEW: Discover local SentenceTransformer embedding models
-        # ------------------------------------------------------------
         try:
             cache_dir = os.path.expanduser("~/.cache/torch/sentence_transformers")
-            discovered_models = []
             if os.path.isdir(cache_dir):
-                for entry in os.listdir(cache_dir):
-                    entry_path = os.path.join(cache_dir, entry)
-                    # Heuristic: model folders usually contain config.json or modules.json
-                    if os.path.isdir(entry_path) and any(
-                        os.path.isfile(os.path.join(entry_path, fname)) for fname in ("config.json", "modules.json")
-                    ):
-                        discovered_models.append(entry)
-
-            # Provide sensible default if nothing discovered
-            if not discovered_models:
-                discovered_models = ["all-MiniLM-L6-v2"]
-
-            self.available_local_embedding_models = discovered_models
-            logger.debug(
-                f"Discovered {len(discovered_models)} local SentenceTransformer models: {discovered_models}"
-            )
-        except Exception as e:
-            logger.warning(f"Error discovering local embedding models: {e}")
+                self.available_local_embedding_models = [
+                    e for e in os.listdir(cache_dir)
+                    if os.path.isdir(os.path.join(cache_dir, e)) and
+                    any(os.path.isfile(os.path.join(cache_dir, e, f)) for f in ("config.json", "modules.json"))
+                ] or ["all-MiniLM-L6-v2"]
+            else:
+                self.available_local_embedding_models = ["all-MiniLM-L6-v2"]
+        except:
             self.available_local_embedding_models = []
 
     def get_formatted_datetime(self, user_timezone=None):
-        """
-        Get properly formatted datetime with timezone awareness
-
-        Args:
-            user_timezone: Optional timezone string to override the default
-
-        Returns:
-            Timezone-aware datetime object
-        """
         timezone_str = user_timezone or self.valves.timezone or "UTC"
-
-        # Normalize common aliases
-        alias_map = {
-            "UAE/Dubai": "Asia/Dubai",
-            "GMT+4": "Asia/Dubai",
-            "GMT +4": "Asia/Dubai",
-            "Dubai": "Asia/Dubai",
-            "EST": "America/New_York",
-            "PST": "America/Los_Angeles",
-            "CST": "America/Chicago",
-            "IST": "Asia/Kolkata",
-            "BST": "Europe/London",
-            "GMT": "Etc/GMT",
-            "UTC": "UTC",
-        }
+        alias_map = {"UAE/Dubai": "Asia/Dubai", "GMT+4": "Asia/Dubai", "GMT +4": "Asia/Dubai", "Dubai": "Asia/Dubai", "EST": "America/New_York", "PST": "America/Los_Angeles", "CST": "America/Chicago", "IST": "Asia/Kolkata", "BST": "Europe/London", "GMT": "Etc/GMT", "UTC": "UTC"}
         tz_key = timezone_str.strip()
         timezone_str = alias_map.get(tz_key, timezone_str)
-
         try:
-            utc_now = datetime.utcnow()
+            utc_now = datetime.now(timezone.utc)
             local_tz = pytz.timezone(timezone_str)
-            local_now = utc_now.replace(tzinfo=pytz.utc).astimezone(local_tz)
-            return local_now
+            return utc_now.astimezone(local_tz)
         except pytz.exceptions.UnknownTimeZoneError:
-            logger.warning(
-                f"Invalid timezone: {timezone_str}, falling back to default 'Asia/Dubai'."
-            )
+            logger.warning(f"Invalid timezone: {timezone_str}, falling back to default 'Asia/Dubai'.")
             try:
                 local_tz = pytz.timezone("Asia/Dubai")
-                local_now = (
-                    datetime.utcnow().replace(tzinfo=pytz.utc).astimezone(local_tz)
-                )
-                return local_now
+                return datetime.now(timezone.utc).astimezone(local_tz)
             except Exception:
                 logger.warning("Fallback timezone also invalid, using UTC")
-                return datetime.utcnow().replace(tzinfo=pytz.utc)
+                return datetime.now(timezone.utc)
 
     def _get_circuit_breaker_key(self, api_url: str, provider_type: str) -> str:
-        """Generate a unique key for circuit breaker state tracking"""
         return f"{provider_type}:{api_url}"
     
     def _is_circuit_breaker_open(self, api_url: str, provider_type: str) -> bool:
-        """Check if circuit breaker is open for the given endpoint"""
         key = self._get_circuit_breaker_key(api_url, provider_type)
         state = self._circuit_breaker_state.get(key, {"failures": 0, "last_failure": 0, "is_open": False})
-        
         if not state.get("is_open", False):
             return False
-            
-        # Check if circuit breaker timeout has passed
         current_time = time.time()
         timeout_duration = self.valves.circuit_breaker_timeout
-        
         if current_time - state.get("last_failure", 0) > timeout_duration:
-            # Reset circuit breaker
             logger.info(f"Circuit breaker reset for {key}")
             state["is_open"] = False
             state["failures"] = 0
             self._circuit_breaker_state[key] = state
             return False
-            
         return True
     
     def _record_circuit_breaker_failure(self, api_url: str, provider_type: str) -> None:
-        """Record a failure for circuit breaker tracking"""
         key = self._get_circuit_breaker_key(api_url, provider_type)
         state = self._circuit_breaker_state.get(key, {"failures": 0, "last_failure": 0, "is_open": False})
-        
         state["failures"] += 1
         state["last_failure"] = time.time()
-        
         if state["failures"] >= self.valves.circuit_breaker_failure_threshold:
             state["is_open"] = True
             logger.warning(f"Circuit breaker opened for {key} after {state['failures']} failures")
-        
         self._circuit_breaker_state[key] = state
     
     def _record_circuit_breaker_success(self, api_url: str, provider_type: str) -> None:
-        """Record a success for circuit breaker tracking"""
         key = self._get_circuit_breaker_key(api_url, provider_type)
         if key in self._circuit_breaker_state:
-            # Reset failure count on success
             self._circuit_breaker_state[key]["failures"] = 0
     
     async def _check_endpoint_health(self, api_url: str, provider_type: str) -> bool:
-        """Perform a health check on the LLM endpoint"""
         key = self._get_circuit_breaker_key(api_url, provider_type)
         current_time = time.time()
-        
-        # Check if we've done a health check recently
         last_check = self._last_health_check.get(key, 0)
         if current_time - last_check < self.valves.health_check_interval:
             return self._connection_health.get(key, True)
-        
         try:
             session = await self._get_aiohttp_session()
-            
-            # Simple health check - just try to connect with minimal data
-            health_data = {
-                "model": "health_check",
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1
-            }
-            
+            health_data = {"model": "health_check", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}
             headers = {"Content-Type": "application/json"}
             if provider_type in ["openai_compatible", "gemini"] and self.valves.llm_api_key:
                 headers["Authorization"] = f"Bearer {self.valves.llm_api_key}"
-            
-            async with session.post(
-                api_url, 
-                json=health_data, 
-                headers=headers, 
-                timeout=aiohttp.ClientTimeout(total=10)  # Short timeout for health checks
-            ) as response:
-                is_healthy = response.status < 500  # Accept any non-server error as healthy
-                
+            async with session.post(api_url, json=health_data, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                is_healthy = response.status < 500
                 self._connection_health[key] = is_healthy
                 self._last_health_check[key] = current_time
-                
-                if is_healthy:
-                    logger.debug(f"Health check passed for {key}")
-                else:
+                if not is_healthy:
                     logger.warning(f"Health check failed for {key}: status {response.status}")
-                
                 return is_healthy
-                
         except Exception as e:
             logger.warning(f"Health check failed for {key}: {e}")
             self._connection_health[key] = False
@@ -3590,97 +1134,39 @@ Your output must be valid JSON only. No additional text.""",
             return False
     
     async def _detect_provider_features(self, api_url: str, provider_type: str, api_key: Optional[str] = None) -> Dict[str, bool]:
-        """Detect API capabilities for different provider versions and features"""
-        features = {
-            "supports_system_messages": True,  # Assume true by default
-            "supports_json_mode": True,
-            "supports_streaming": True,
-            "supports_function_calling": False,
-            "supports_vision": False,
-            "requires_auth": provider_type in ["openai_compatible", "gemini"]
-        }
-        
+        features = {"supports_system_messages": True, "supports_json_mode": True, "supports_streaming": True, "supports_function_calling": False, "supports_vision": False, "requires_auth": provider_type in ["openai_compatible", "gemini"]}
         try:
             session = await self._get_aiohttp_session()
             headers = {"Content-Type": "application/json"}
-            
-            # Add authentication if required
             if features["requires_auth"] and api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
-            
-            # Test basic completion capability
-            test_data = {
-                "model": "test",  # Use a generic model name for testing
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
-                "stream": False
-            }
-            
-            # Test JSON mode support
+            test_data = {"model": "test", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1, "stream": False}
             if provider_type in ["openai_compatible", "gemini"]:
                 test_data["response_format"] = {"type": "json_object"}
-            
-            logger.debug(f"Testing provider capabilities for {provider_type} at {api_url}")
-            
-            async with session.post(
-                api_url, 
-                json=test_data, 
-                headers=headers, 
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as response:
+            async with session.post(api_url, json=test_data, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
                 if response.status == 400:
-                    # Parse error response to detect unsupported features
                     error_text = await response.text()
                     if "json_object" in error_text.lower() or "response_format" in error_text.lower():
                         features["supports_json_mode"] = False
-                        logger.debug(f"JSON mode not supported for {provider_type}")
-                elif response.status < 500:
-                    # Success or client error indicates endpoint is reachable
-                    logger.debug(f"Basic capability test passed for {provider_type}")
-                
-                # Gemini-specific feature detection
                 if provider_type == "gemini":
-                    features["supports_vision"] = True  # Most Gemini models support vision
-                    features["supports_function_calling"] = True  # Gemini supports function calling
-                    features["supports_json_mode"] = True  # Gemini supports JSON mode via responseMimeType
-                    features["supports_system_messages"] = True  # Gemini supports system instructions
-                    features["supports_streaming"] = True  # Gemini supports streaming responses
-                    
-                # Store detected features for this provider
+                    features.update({"supports_vision": True, "supports_function_calling": True, "supports_json_mode": True, "supports_system_messages": True, "supports_streaming": True})
                 cache_key = f"{provider_type}_{api_url}"
                 if not hasattr(self, '_provider_features'):
                     self._provider_features = {}
                 self._provider_features[cache_key] = features
-                
-        except Exception as e:
-            logger.warning(f"Feature detection failed for {provider_type}: {e}")
-            # Use conservative defaults on failure
-            features.update({
-                "supports_json_mode": False,
-                "supports_streaming": False,
-                "supports_function_calling": False,
-                "supports_vision": False
-            })
-        
+        except:
+            features.update({"supports_json_mode": False, "supports_streaming": False, "supports_function_calling": False, "supports_vision": False})
         return features
     
     async def _get_provider_features(self, provider_type: str, api_url: str, api_key: Optional[str] = None) -> Dict[str, bool]:
-        """Get cached provider features or detect them if not cached"""
         cache_key = f"{provider_type}_{api_url}"
-        
         if not hasattr(self, '_provider_features'):
             self._provider_features = {}
-            
         if cache_key not in self._provider_features:
             self._provider_features[cache_key] = await self._detect_provider_features(api_url, provider_type, api_key)
-            
         return self._provider_features[cache_key]
     
     def _is_memory_processing_circuit_open(self) -> bool:
-        """Check if memory processing circuit breaker is open"""
-        timeout = getattr(self.valves, 'circuit_breaker_reset_time', 300.0)
-        failure_count = getattr(self.valves, 'circuit_breaker_failure_count', 3)
-        
         if not hasattr(self, 'memory_processing_circuit_open'):
             self.memory_processing_circuit_open = False
             self.memory_processing_failures = 0
@@ -3729,74 +1215,29 @@ Your output must be valid JSON only. No additional text.""",
         return operations
     
     async def _create_fallback_memory_from_preference(self, user_message: str) -> List[Dict[str, Any]]:
-        """Create a fallback memory operation for preference statements when LLM processing fails"""
-        # Simple regex patterns for preference detection
-        preference_patterns = [
-            r"(i|my)\s+(favorite|love|like|prefer|enjoy|hate|dislike)\s+([^.!?]+)",
-            r"(i|my)\s+(am|is)\s+([^.!?]+)",
-            r"(i|my)\s+(work|live|study)\s+([^.!?]+)",
-        ]
-        
+        preference_patterns = [r"(i|my)\s+(favorite|love|like|prefer|enjoy|hate|dislike)\s+([^.!?]+)", r"(i|my)\s+(am|is)\s+([^.!?]+)", r"(i|my)\s+(work|live|study)\s+([^.!?]+)"]
         for pattern in preference_patterns:
             match = re.search(pattern, user_message.lower(), re.IGNORECASE)
             if match:
                 content = f"User preference: {match.group(0).strip()}"
                 logger.info(f"Created fallback memory from preference pattern: {content}")
-                return [{
-                    "operation": "NEW",
-                    "content": content,
-                    "tags": ["preference"],
-                    "memory_bank": "General",
-                    "confidence": 0.6
-                }]
-        
+                return [{"operation": "NEW", "content": content, "tags": ["preference"], "memory_bank": "General", "confidence": 0.6}]
         return []
 
     async def _get_aiohttp_session(self) -> aiohttp.ClientSession:
-        """Get or create an aiohttp session with optimized connection pooling"""
         if self._aiohttp_session is None or self._aiohttp_session.closed:
-            # Create connector with connection pooling configuration
             if self._session_connector is None or self._session_connector.closed:
-                self._session_connector = TCPConnector(
-                    limit=self.valves.connection_pool_size,
-                    limit_per_host=self.valves.max_concurrent_connections,
-                    ttl_dns_cache=self.valves.dns_cache_ttl,
-                    use_dns_cache=True,
-                    enable_cleanup_closed=True,
-                    force_close=False,
-                    keepalive_timeout=self.valves.connection_keepalive_timeout
-                )
-            
-            # Create session with comprehensive timeout configuration
-            timeout = ClientTimeout(
-                total=self.valves.request_timeout,
-                connect=self.valves.connection_timeout,
-                sock_read=self.valves.request_timeout,
-                sock_connect=self.valves.connection_timeout
-            )
-            
-            self._aiohttp_session = aiohttp.ClientSession(
-                connector=self._session_connector,
-                timeout=timeout,
-                raise_for_status=False,  # Handle status codes manually for better error handling
-                trust_env=True  # Trust environment proxy settings
-            )
-            
-            logger.debug("Created new aiohttp session with optimized connection pooling")
-        
+                self._session_connector = TCPConnector(limit=self.valves.connection_pool_size, limit_per_host=self.valves.max_concurrent_connections, ttl_dns_cache=self.valves.dns_cache_ttl, use_dns_cache=True, enable_cleanup_closed=True, force_close=False, keepalive_timeout=self.valves.connection_keepalive_timeout)
+            timeout = ClientTimeout(total=self.valves.request_timeout, connect=self.valves.connection_timeout, sock_read=self.valves.request_timeout, sock_connect=self.valves.connection_timeout)
+            self._aiohttp_session = aiohttp.ClientSession(connector=self._session_connector, timeout=timeout, raise_for_status=False, trust_env=True)
         return self._aiohttp_session
     
     async def _cleanup_connections(self) -> None:
-        """Clean up aiohttp session and connector resources"""
         try:
             if self._aiohttp_session and not self._aiohttp_session.closed:
                 await self._aiohttp_session.close()
-                logger.debug("Closed aiohttp session")
-            
             if self._session_connector and not self._session_connector.closed:
                 await self._session_connector.close()
-                logger.debug("Closed session connector")
-                
         except Exception as e:
             logger.warning(f"Error during connection cleanup: {e}")
         finally:
@@ -3804,235 +1245,53 @@ Your output must be valid JSON only. No additional text.""",
             self._session_connector = None
     
     def get_connection_stats(self) -> Dict[str, Any]:
-        """Get current connection statistics and circuit breaker states"""
-        return {
-            "circuit_breakers": dict(self._circuit_breaker_state),
-            "connection_health": dict(self._connection_health),
-            "last_health_checks": dict(self._last_health_check),
-            "session_open": self._aiohttp_session is not None and not self._aiohttp_session.closed if self._aiohttp_session else False,
-            "connector_open": self._session_connector is not None and not self._session_connector.closed if self._session_connector else False
-        }
+        return {"circuit_breakers": dict(self._circuit_breaker_state), "connection_health": dict(self._connection_health), "last_health_checks": dict(self._last_health_check), "session_open": self._aiohttp_session is not None and not self._aiohttp_session.closed if self._aiohttp_session else False, "connector_open": self._session_connector is not None and not self._session_connector.closed if self._session_connector else False}
     
     async def _diagnose_connection_issues(self, api_url: str, provider_type: str, error: Exception) -> Dict[str, Any]:
-        """Comprehensive connection diagnostics to identify specific failure reasons"""
         key = self._get_circuit_breaker_key(api_url, provider_type)
-        diagnostics = {
-            "endpoint": api_url,
-            "provider": provider_type,
-            "error_type": type(error).__name__,
-            "error_message": str(error),
-            "timestamp": time.time(),
-            "tests": {}
-        }
-        
+        diagnostics = {"endpoint": api_url, "provider": provider_type, "error_type": type(error).__name__, "error_message": str(error), "timestamp": time.time(), "tests": {}}
         if not self.valves.enable_connection_diagnostics:
             diagnostics["tests"]["diagnostics_disabled"] = True
             return diagnostics
-        
         try:
             session = await self._get_aiohttp_session()
-            
-            # Test 1: Basic connectivity (no API call, just connection)
-            try:
-                from urllib.parse import urlparse
-                parsed_url = urlparse(api_url)
-                base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-                
-                async with session.get(base_url, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                    diagnostics["tests"]["basic_connectivity"] = {
-                        "status": "success",
-                        "response_code": response.status,
-                        "response_time": time.time() - diagnostics["timestamp"]
-                    }
-            except Exception as e:
-                diagnostics["tests"]["basic_connectivity"] = {
-                    "status": "failed",
-                    "error": str(e),
-                    "error_type": type(e).__name__
-                }
-            
-            # Test 2: API Key validation (if applicable)
-            if provider_type in ["openai_compatible", "gemini"]:
-                if not self.valves.llm_api_key:
-                    diagnostics["tests"]["api_key_validation"] = {
-                        "status": "failed",
-                        "error": "API key not configured"
-                    }
-                elif not self.valves.llm_api_key.strip():
-                    diagnostics["tests"]["api_key_validation"] = {
-                        "status": "failed", 
-                        "error": "API key is empty"
-                    }
-                else:
-                    diagnostics["tests"]["api_key_validation"] = {
-                        "status": "success",
-                        "key_length": len(self.valves.llm_api_key),
-                        "key_format": "Bearer token configured"
-                    }
-            else:
-                diagnostics["tests"]["api_key_validation"] = {
-                    "status": "not_required",
-                    "provider": provider_type
-                }
-            
-            # Test 3: Endpoint format validation
-            endpoint_issues = []
-            if not api_url.startswith(("http://", "https://")):
-                endpoint_issues.append("URL must start with http:// or https://")
-            if "localhost" in api_url and provider_type == "ollama":
-                endpoint_issues.append("Consider using host.docker.internal instead of localhost for Docker deployments")
-            if not api_url.endswith("/chat") and provider_type == "ollama":
-                endpoint_issues.append("Ollama API endpoint should typically end with /api/chat")
-            if "/v1/" not in api_url and provider_type in ["openai_compatible", "gemini"]:
-                endpoint_issues.append("OpenAI-compatible APIs typically include /v1/ in the path")
-                
-            diagnostics["tests"]["endpoint_format"] = {
-                "status": "success" if not endpoint_issues else "warnings",
-                "issues": endpoint_issues,
-                "url": api_url
-            }
-            
-            # Test 4: Model availability (light test)
-            try:
-                test_data = {
-                    "model": self.valves.llm_model_name,
-                    "messages": [{"role": "user", "content": "test"}],
-                    "max_tokens": 1
-                }
-                
-                headers = {"Content-Type": "application/json"}
-                if provider_type in ["openai_compatible", "gemini"] and self.valves.llm_api_key:
-                    headers["Authorization"] = f"Bearer {self.valves.llm_api_key}"
-                
-                async with session.post(
-                    api_url,
-                    json=test_data,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=15)
-                ) as response:
-                    if response.status == 200:
-                        diagnostics["tests"]["model_availability"] = {
-                            "status": "success",
-                            "model": self.valves.llm_model_name,
-                            "response_code": response.status
-                        }
-                    elif response.status == 401:
-                        diagnostics["tests"]["model_availability"] = {
-                            "status": "failed",
-                            "error": "Authentication failed - check API key",
-                            "response_code": response.status
-                        }
-                    elif response.status == 404:
-                        diagnostics["tests"]["model_availability"] = {
-                            "status": "failed", 
-                            "error": f"Model '{self.valves.llm_model_name}' not found or endpoint incorrect",
-                            "response_code": response.status
-                        }
-                    elif response.status == 429:
-                        diagnostics["tests"]["model_availability"] = {
-                            "status": "rate_limited",
-                            "error": "Rate limited - too many requests",
-                            "response_code": response.status
-                        }
-                    else:
-                        error_text = await response.text()
-                        diagnostics["tests"]["model_availability"] = {
-                            "status": "failed",
-                            "error": f"HTTP {response.status}: {error_text[:200]}",
-                            "response_code": response.status
-                        }
-                        
-            except asyncio.TimeoutError:
-                diagnostics["tests"]["model_availability"] = {
-                    "status": "failed",
-                    "error": "Request timed out - endpoint may be slow or unresponsive"
-                }
-            except Exception as e:
-                diagnostics["tests"]["model_availability"] = {
-                    "status": "failed",
-                    "error": str(e),
-                    "error_type": type(e).__name__
-                }
-            
-            # Test 5: Circuit breaker status
-            cb_state = self._circuit_breaker_state.get(key, {})
-            diagnostics["tests"]["circuit_breaker"] = {
-                "status": "open" if cb_state.get("is_open", False) else "closed",
-                "failure_count": cb_state.get("failures", 0),
-                "last_failure": cb_state.get("last_failure", 0),
-                "threshold": self.valves.circuit_breaker_failure_threshold
-            }
-            
-        except Exception as diag_error:
-            diagnostics["tests"]["diagnostic_error"] = {
-                "status": "failed",
-                "error": f"Diagnostics failed: {str(diag_error)}"
-            }
-        
+            test_data = {"model": self.valves.llm_model_name, "messages": [{"role": "user", "content": "test"}], "max_tokens": 1}
+            headers = {"Content-Type": "application/json"}
+            if provider_type in ["openai_compatible", "gemini"] and self.valves.llm_api_key:
+                headers["Authorization"] = f"Bearer {self.valves.llm_api_key}"
+            async with session.post(api_url, json=test_data, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                status = response.status
+                diagnostics["tests"]["model_availability"] = {"status": "success" if status == 200 else "failed", "response_code": status}
+                if status != 200:
+                    diagnostics["tests"]["model_availability"]["error"] = "Auth failed" if status == 401 else f"HTTP {status}"
+        except Exception as e:
+            diagnostics["tests"]["model_availability"] = {"status": "failed", "error": str(e)[:100]}
+        cb_state = self._circuit_breaker_state.get(key, {})
+        diagnostics["tests"]["circuit_breaker"] = {"status": "open" if cb_state.get("is_open", False) else "closed", "failure_count": cb_state.get("failures", 0)}
         return diagnostics
     
     async def _get_connection_troubleshooting_tips(self, diagnostics: Dict[str, Any]) -> List[str]:
-        """Generate specific troubleshooting tips based on diagnostics"""
         tips = []
         tests = diagnostics.get("tests", {})
         provider = diagnostics.get("provider", "unknown")
-        
-        # Connectivity issues
-        if tests.get("basic_connectivity", {}).get("status") == "failed":
-            tips.append("🔌 Basic connectivity failed - check if the server is running and accessible")
-            if "localhost" in diagnostics.get("endpoint", ""):
-                tips.append("💡 If running in Docker, try changing 'localhost' to 'host.docker.internal'")
-        
-        # API key issues
-        api_key_test = tests.get("api_key_validation", {})
-        if api_key_test.get("status") == "failed":
-            if "not configured" in api_key_test.get("error", ""):
-                tips.append("🗝️ API key is required but not configured - add it in the valves settings")
-            elif "empty" in api_key_test.get("error", ""):
-                tips.append("🗝️ API key is empty - check the valves configuration")
-        
-        # Model issues
         model_test = tests.get("model_availability", {})
         if model_test.get("status") == "failed":
-            if model_test.get("response_code") == 404:
-                if provider == "ollama":
-                    tips.append(f"📦 Model '{diagnostics.get('endpoint', '').split('/')[-1]}' not found in Ollama - try 'ollama pull <model>' first")
-                else:
-                    tips.append("📦 Model not found - check the model name in valves settings")
-            elif model_test.get("response_code") == 401:
-                tips.append("🔐 Authentication failed - verify your API key is correct and has proper permissions")
-        elif model_test.get("status") == "rate_limited":
-            tips.append("🚦 Rate limited - wait a moment or check your API usage limits")
-        
-        # Endpoint format issues
-        endpoint_test = tests.get("endpoint_format", {})
-        if endpoint_test.get("status") == "warnings":
-            for issue in endpoint_test.get("issues", []):
-                tips.append(f"⚠️ {issue}")
-        
-        # Circuit breaker issues
+            if model_test.get("response_code") == 401:
+                tips.append("🔐 Authentication failed - check API key")
+            elif model_test.get("response_code") == 404:
+                tips.append("📦 Model not found - check model name")
+            else:
+                tips.append("🔌 Connection failed - check endpoint")
         cb_test = tests.get("circuit_breaker", {})
         if cb_test.get("status") == "open":
-            tips.append(f"🔴 Circuit breaker is open due to {cb_test.get('failure_count', 0)} consecutive failures")
-            tips.append("⏱️ Wait for the circuit breaker to reset or restart the plugin to reset it manually")
-        
-        # General tips
+            tips.append(f"🔴 Circuit breaker open after {cb_test.get('failure_count', 0)} failures")
         if provider == "ollama":
-            tips.append("🦙 For Ollama: Ensure the service is running with 'ollama serve' and the model is pulled")
-        elif provider in ["openai_compatible", "gemini"]:
-            tips.append("🌐 For API-based providers: Check your internet connection and API service status")
-        
+            tips.append("🦙 Ensure Ollama service is running")
         return tips
     
     def reset_circuit_breakers(self, api_url: Optional[str] = None, provider_type: Optional[str] = None) -> Dict[str, Any]:
-        """Reset circuit breakers for troubleshooting - can reset specific endpoint or all"""
-        reset_info = {
-            "reset_count": 0,
-            "reset_endpoints": []
-        }
-        
+        reset_info = {"reset_count": 0, "reset_endpoints": []}
         if api_url and provider_type:
-            # Reset specific endpoint
             key = self._get_circuit_breaker_key(api_url, provider_type)
             if key in self._circuit_breaker_state:
                 self._circuit_breaker_state[key] = {"failures": 0, "last_failure": 0, "is_open": False}
@@ -4040,69 +1299,37 @@ Your output must be valid JSON only. No additional text.""",
                 reset_info["reset_endpoints"].append(key)
                 logger.info(f"Reset circuit breaker for {key}")
         else:
-            # Reset all circuit breakers
             reset_info["reset_count"] = len(self._circuit_breaker_state)
             reset_info["reset_endpoints"] = list(self._circuit_breaker_state.keys())
             self._circuit_breaker_state.clear()
             logger.info("Reset all circuit breakers")
-        
         return reset_info
     
     async def test_llm_connection(self, timeout: float = 30.0) -> Dict[str, Any]:
-        """Test LLM connection with comprehensive reporting"""
         provider_type = self.valves.llm_provider_type
         api_url = self.valves.llm_api_endpoint_url
         model_name = self.valves.llm_model_name
-        
-        test_result = {
-            "provider": provider_type,
-            "endpoint": api_url, 
-            "model": model_name,
-            "timestamp": time.time(),
-            "success": False,
-            "response_time": 0.0,
-            "error": None,
-            "diagnostics": None
-        }
-        
+        test_result = {"provider": provider_type, "endpoint": api_url, "model": model_name, "timestamp": time.time(), "success": False, "response_time": 0.0, "error": None, "diagnostics": None}
         start_time = time.time()
-        
         try:
-            # Simple test message
-            test_response = await asyncio.wait_for(
-                self.query_llm_with_retry(
-                    "You are a connection test assistant.",
-                    "Reply with exactly: TEST_SUCCESSFUL"
-                ),
-                timeout=timeout
-            )
-            
+            test_response = await asyncio.wait_for(self.query_llm_with_retry("You are a connection test assistant.", "Reply with exactly: TEST_SUCCESSFUL"), timeout=timeout)
             test_result["response_time"] = time.time() - start_time
-            
             if "TEST_SUCCESSFUL" in test_response and not test_response.startswith("Error:"):
                 test_result["success"] = True
                 test_result["response"] = test_response
             else:
-                test_result["error"] = f"Unexpected response: {test_response[:100]}..."
-                if test_response.startswith("Error:"):
-                    test_result["error"] = test_response
-                
+                test_result["error"] = test_response if test_response.startswith("Error:") else f"Unexpected response: {test_response[:100]}..."
         except asyncio.TimeoutError:
             test_result["error"] = f"Connection test timed out after {timeout} seconds"
             test_result["response_time"] = timeout
         except Exception as e:
             test_result["error"] = str(e)
             test_result["response_time"] = time.time() - start_time
-        
-        # Add diagnostics on failure
         if not test_result["success"]:
             try:
-                test_result["diagnostics"] = await self._diagnose_connection_issues(
-                    api_url, provider_type, Exception(test_result["error"] or "Test failed")
-                )
+                test_result["diagnostics"] = await self._diagnose_connection_issues(api_url, provider_type, Exception(test_result["error"] or "Test failed"))
             except Exception as e:
                 test_result["diagnostics_error"] = str(e)
-        
         return test_result
 
     async def async_inlet(
@@ -4221,7 +1448,6 @@ Your output must be valid JSON only. No additional text.""",
             user_valves = self._get_user_valves(__user__)
 
             if not user_valves.enabled:
-                logger.debug(f"Memory plugin disabled for user {user_id}. Skipping.")
                 return body # Return early if disabled
 
             # Respect per-user setting for status visibility, ensuring it's set after loading
@@ -4652,7 +1878,6 @@ Your output must be valid JSON only. No additional text.""",
         # logger.debug("****** OUTLET FUNCTION CALLED ******") # REMOVED
 
         # Log function entry
-        logger.debug("Outlet called - making deep copy of body dictionary")
 
         # DEFENSIVE: Make a deep copy of the body to avoid dictionary changed size during iteration
         # This was a source of many subtle bugs
@@ -4813,107 +2038,60 @@ Your output must be valid JSON only. No additional text.""",
         # Return the modified response
         return body_copy
 
-    async def _safe_emit(
-        self,
-        event_emitter: Optional[Callable[[Any], Awaitable[None]]],
-        data: Dict[str, Any],
-    ) -> None:
-        """Safely emit an event, handling missing emitter"""
+    async def _safe_emit(self, event_emitter: Optional[Callable[[Any], Awaitable[None]]], data: Dict[str, Any]) -> None:
         if not event_emitter:
             logger.debug("Event emitter not available")
             return
-
         try:
             await event_emitter(data)
         except Exception as e:
             logger.error(f"Error in event emitter: {e}")
 
     def _get_user_valves(self, __user__: dict) -> UserValves:
-        """Extract and validate user valves settings"""
         if not __user__:
             logger.warning("No user information provided")
             return self.UserValves()
-
-        # Access the valves attribute directly from the UserModel object
-        user_valves_data = getattr(
-            __user__, "valves", {}
-        )  # Use getattr for safe access
-
-        # Ensure we have a dictionary to work with
+        user_valves_data = getattr(__user__, "valves", {})
         if not isinstance(user_valves_data, dict):
-            logger.warning(
-                f"User valves attribute is not a dictionary (type: {type(user_valves_data)}), using defaults."
-            )
+            logger.warning(f"User valves attribute is not a dictionary (type: {type(user_valves_data)}), using defaults.")
             user_valves_data = {}
-
         try:
-            # Validate and return the UserValves model
             return self.UserValves(**user_valves_data)
         except Exception as e:
-            # Default to enabled if validation/extraction fails
-            logger.error(
-                f"Could not determine user valves settings from data {user_valves_data}: {e}"
-            )
-            return self.UserValves()  # Return default UserValves on error
+            logger.error(f"Could not determine user valves settings from data {user_valves_data}: {e}")
+            return self.UserValves()
 
     async def _get_formatted_memories(self, user_id: str) -> List[Dict[str, Any]]:
-        """Get all memories for a user and format them for processing"""
-        # Validate user_id
         if not user_id:
             logger.error("_get_formatted_memories called without user_id")
             raise ValueError("user_id is required for fetching memories")
-            
         memories_list = []
         try:
             logger.debug(f"Fetching memories for user_id: {user_id}")
-            # Get memories using Memories.get_memories_by_user_id
             user_memories = Memories.get_memories_by_user_id(user_id=str(user_id))
-
             if user_memories:
                 for memory in user_memories:
-                    # Safely extract attributes with fallbacks
                     memory_id = str(getattr(memory, "id", "unknown"))
                     memory_content = getattr(memory, "content", "")
                     created_at = getattr(memory, "created_at", None)
                     updated_at = getattr(memory, "updated_at", None)
-
-                    memories_list.append(
-                        {
-                            "id": memory_id,
-                            "memory": memory_content,
-                            "created_at": created_at,
-                            "updated_at": updated_at,
-                        }
-                    )
-
+                    memories_list.append({
+                        "id": memory_id,
+                        "memory": memory_content,
+                        "created_at": created_at,
+                        "updated_at": updated_at,
+                    })
             logger.debug(f"Retrieved {len(memories_list)} memories for user {user_id}")
             return memories_list
-
         except Exception as e:
-            logger.error(
-                f"Error getting formatted memories: {e}\n{traceback.format_exc()}"
-            )
+            logger.error(f"Error getting formatted memories: {e}\n{traceback.format_exc()}")
             return []
 
-    def _inject_memories_into_context(
-        self, body: Dict[str, Any], memories: List[Dict[str, Any]]
-    ) -> None:
-        """Inject relevant memories into the system context"""
+    def _inject_memories_into_context(self, body: Dict[str, Any], memories: List[Dict[str, Any]]) -> None:
         if not memories:
-            # Suppress fallback injection when no relevant memories
             return
-
-        # Sort memories by relevance if available
-        sorted_memories = sorted(
-            memories, key=lambda x: x.get("relevance", 0), reverse=True
-        )
-
-        # Format memories based on user preference
-        memory_context = self._format_memories_for_context(
-            sorted_memories, self.valves.memory_format
-        )
-
-        # Prepend instruction to avoid LLM meta-comments
+        sorted_memories = sorted(memories, key=lambda x: x.get("relevance", 0), reverse=True)
+        memory_context = self._format_memories_for_context(sorted_memories, self.valves.memory_format)
         instruction = (
             "Here is background info about the user. "
             "Do NOT mention this info explicitly unless relevant to the user's query. "
@@ -4925,11 +2103,7 @@ Your output must be valid JSON only. No additional text.""",
             "Only answer the user's question directly.\n\n"
         )
         memory_context = instruction + memory_context
-
-        # Log injected memories for debugging
         logger.debug(f"Injected memories:\n{memory_context[:500]}...")
-
-        # Add to system message or create a new one if none exists
         if "messages" in body:
             system_message_exists = False
             for message in body["messages"]:
@@ -4937,93 +2111,37 @@ Your output must be valid JSON only. No additional text.""",
                     message["content"] += f"\n\n{memory_context}"
                     system_message_exists = True
                     break
-
             if not system_message_exists:
-                body["messages"].insert(
-                    0, {"role": "system", "content": memory_context}
-                )
+                body["messages"].insert(0, {"role": "system", "content": memory_context})
 
-    def _format_memories_for_context(
-        self, memories: List[Dict[str, Any]], format_type: str
-    ) -> str:
-        """Format memories for context injection based on format preference"""
+    def _format_memories_for_context(self, memories: List[Dict[str, Any]], format_type: str) -> str:
         if not memories:
             return ""
-
         max_len = getattr(self.valves, "max_injected_memory_length", 300)
-
-        # Start with header
         memory_context = "I recall the following about you:\n"
-
-        # Extract tags and add each memory according to specified format
-        if format_type == "bullet":
-            for mem in memories:
-                tags_match = re.match(r"\[Tags: (.*?)\] (.*)", mem["memory"])
-                if tags_match:
-                    tags = tags_match.group(1)
-                    content = tags_match.group(2)[:max_len]
-                    memory_context += f"- {content} (tags: {tags})\n"
-                else:
-                    content = mem["memory"][:max_len]
-                    memory_context += f"- {content}\n"
-
-        elif format_type == "numbered":
-            for i, mem in enumerate(memories, 1):
-                tags_match = re.match(r"\[Tags: (.*?)\] (.*)", mem["memory"])
-                if tags_match:
-                    tags = tags_match.group(1)
-                    content = tags_match.group(2)[:max_len]
-                    memory_context += f"{i}. {content} (tags: {tags})\n"
-                else:
-                    content = mem["memory"][:max_len]
-                    memory_context += f"{i}. {content}\n"
-
-        else:  # paragraph format
-            memories_text = []
-            for mem in memories:
-                tags_match = re.match(r"\[Tags: (.*?)\] (.*)", mem["memory"])
-                if tags_match:
-                    content = tags_match.group(2)[:max_len]
-                    memories_text.append(content)
-                else:
-                    content = mem["memory"][:max_len]
-                    memories_text.append(content)
-
-            memory_context += f"{'. '.join(memories_text)}.\n"
-
+        for i, mem in enumerate(memories, 1):
+            tags_match = re.match(r"\[Tags: (.*?)\] (.*)", mem["memory"])
+            content = tags_match.group(2)[:max_len] if tags_match else mem["memory"][:max_len]
+            tags = f" (tags: {tags_match.group(1)})" if tags_match and format_type != "prose" else ""
+            if format_type == "bullet":
+                memory_context += f"- {content}{tags}\n"
+            elif format_type == "numbered":
+                memory_context += f"{i}. {content}{tags}\n"
+            else:
+                memory_context += f"{content}. "
         return memory_context
 
-    async def _process_user_memories(
-        self,
-        user_message: str,
-        user_id: str,
-        event_emitter: Optional[
-            Callable[[Any], Awaitable[None]]
-        ] = None,  # Renamed for clarity
-        show_status: bool = True,
-        user_timezone: str = None,
-        recent_chat_history: Optional[
-            List[Dict[str, Any]]
-        ] = None,  # Added this argument
-    ) -> List[Dict[str, Any]]:
-        """Process user message to extract and store memories
-
-        Returns:
-            List of stored memory operations
-        """
-        # Validate user_id
+    async def _process_user_memories(self, user_message: str, user_id: str,
+                                    event_emitter: Optional[Callable[[Any], Awaitable[None]]] = None,
+                                    show_status: bool = True, user_timezone: str = None,
+                                    recent_chat_history: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         if not user_id:
             logger.error("_process_user_memories called without user_id")
             raise ValueError("user_id is required for memory processing")
-        
-        # Ensure configuration persistence before processing
         if not self._ensure_configuration_persistence():
             logger.warning("Configuration persistence check failed in _process_user_memories, but continuing with current config")
-            
-        # --- ADD LOGGING TO INSPECT self.config ---
         config_content = getattr(self, "config", "<Not Set>")
-        logger.info(f"Inspecting self.config at start of _process_user_memories for user {user_id}: {config_content}")
-        # --- END LOGGING --- 
+        logger.info(f"Inspecting self.config at start of _process_user_memories for user {user_id}: {config_content}") 
 
         # Start timer
         start_time = time.perf_counter()
@@ -5852,12 +2970,9 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             )
             op["memory_bank"] = self.valves.default_memory_bank
 
-        # Validate confidence score
         if "confidence" in op:
             if isinstance(op["confidence"], (int, float)):
-                if 0.0 <= op["confidence"] <= 1.0:
-                    pass  # Valid confidence score
-                else:
+                if not 0.0 <= op["confidence"] <= 1.0:
                     logger.warning(f"Invalid confidence score range: {op['confidence']}")
                     return False
             else:
@@ -5866,214 +2981,144 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
         else:
             logger.warning("Missing confidence score")
             return False
-
         return True
 
     def _extract_and_parse_json(self, text: str) -> Union[List, Dict, None]:
-        """Extracts JSON object or array from text, trying various methods."""
+        """
+        Enhanced JSON extraction and parsing with comprehensive repair capabilities.
+        
+        Uses the JSON repair system to handle malformed JSON from sub-3B models
+        and other LLM APIs with robust fallback mechanisms.
+        """
         if not text:
             return None
 
-        # Initialize loop protection variables
-        iteration_count = 0
-        max_iterations = 100  # Prevent infinite loops
-
-        # --- NEW: Log raw LLM response ---
-        logger.debug(f"Raw LLM response content received:\\n>>>\\n{text}\\n<<<")
-        # --- END NEW ---
-
-        # 1. Attempt direct parsing (most common case)
+        logger.debug(f"Raw LLM response content received: {text[:200]}...")
+        
+        # Use enhanced JSON parser if available
+        if self._json_parser is not None:
+            try:
+                # Create context for memory operations
+                context = {
+                    "expect_operations": True,
+                    "memory_operations": True
+                }
+                
+                result = self._json_parser.parse_with_repair(text, context=context)
+                
+                if result.success:
+                    logger.debug(f"JSON repair successful using method: {result.repair_method}")
+                    
+                    # Apply the same post-processing logic as before
+                    parsed = result.parsed_data
+                    
+                    # Unwrap single-key objects containing lists
+                    if isinstance(parsed, dict) and len(parsed) == 1:
+                        sole_value = next(iter(parsed.values()))
+                        if isinstance(sole_value, list):
+                            logger.debug("Unwrapped single-key object returned by LLM into list of operations.")
+                            parsed = sole_value
+                    
+                    # Handle empty results
+                    if parsed == {} or parsed == []:
+                        logger.info("LLM returned empty object/array, treating as empty memory list")
+                        return []
+                    
+                    # Validate memory operations if enabled
+                    if hasattr(self._json_parser.repair_system, 'validate_memory_operations') and parsed is not None:
+                        validation_errors = self._json_parser.repair_system.validate_memory_operations(parsed)
+                        if validation_errors:
+                            logger.warning(f"Memory operation validation found issues: {validation_errors}")
+                            # Still return the data, but log the issues
+                    
+                    return parsed
+                else:
+                    logger.warning(f"JSON repair failed: {result.validation_errors}")
+                    # Fall back to legacy parsing
+                    
+            except Exception as e:
+                logger.error(f"Error in enhanced JSON parsing: {e}")
+                # Fall back to legacy parsing
+        
+        # Legacy parsing fallback (simplified version of original logic)
+        logger.debug("Using legacy JSON parsing fallback")
+        
         try:
             parsed = json.loads(text)
-            logger.debug("Successfully parsed JSON directly after pre-processing.")
-            # ---- NEW: unwrap single-key object -> list automatically ----
+            logger.debug("Successfully parsed JSON directly with legacy parser.")
             if isinstance(parsed, dict) and len(parsed) == 1:
                 sole_value = next(iter(parsed.values()))
                 if isinstance(sole_value, list):
                     logger.debug("Unwrapped single-key object returned by LLM into list of operations.")
                     parsed = sole_value
-            # ------------------------------------------------------------
             if parsed == {} or parsed == []:
                 logger.info("LLM returned empty object/array, treating as empty memory list")
                 return []
             return parsed
         except json.JSONDecodeError as e:
-            logger.warning(f"Direct JSON parsing failed after pre-processing: {e}")
-            # Continue to more specific extraction attempts if direct parsing fails
+            logger.warning(f"Direct JSON parsing failed: {e}")
 
-
-        # --- Stage 3: Specific Pattern Extraction (If direct parsing failed) ---
-
-        # Try extracting from potential JSON code blocks (already handled by stripping, but as fallback)
-        code_block_pattern = r"```(?:json)?\\s*(\\[[\\s\\S]*?\\]|\\{[\\s\\S]*?\\})\\s*```"
+        # Try extracting from code blocks
+        code_block_pattern = r"```(?:json)?\s*(\[[\s\S]*?\]|\{[\s\S]*?\})\s*```"
         matches = re.findall(code_block_pattern, text)
         if matches:
-            logger.debug(f"Found {len(matches)} JSON code blocks (fallback check)")
+            logger.debug(f"Found {len(matches)} JSON code blocks (legacy fallback)")
             for i, match in enumerate(matches):
                 try:
                     parsed = json.loads(match)
-                    logger.debug(f"Successfully parsed JSON from code block {i+1} (fallback)")
+                    logger.debug(f"Successfully parsed JSON from code block {i+1} (legacy fallback)")
                     if parsed == {} or parsed == []: continue
                     return parsed
                 except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse JSON from code block {i+1} (fallback): {e}")
+                    logger.warning(f"Failed to parse JSON from code block {i+1} (legacy fallback): {e}")
 
-        # Try finding JSON directly (more refined patterns) with hang prevention
-        # Prioritize array of objects, then single object, then empty array
-        direct_json_patterns = [
-            r"(\\s*\\{\\s*\"operation\":.*?\\}\\s*,?)+", # Matches one or more operation objects
-            r"\\[\\s*\\{\\s*\"operation\":.*?\\}\\s*\\]", # Full array of objects
-            r"\\{\\s*\"operation\":.*?\\}", # Single operation object
-            r"\\[\\s*\\]", # Empty array explicitly
-        ]
-        for pattern in direct_json_patterns:
-            iteration_count += 1
-            if iteration_count > max_iterations:
-                logger.error(f"JSON parsing exceeded max iterations ({max_iterations}) - preventing infinite loop")
-                self.error_counters["json_parse_loop_errors"] = self.error_counters.get("json_parse_loop_errors", 0) + 1
-                return None
-                
-            # Find the *first* potential match
-            match = re.search(pattern, text)
-            if match:
-                potential_json_str = match.group(0)
-                # If the pattern is for multiple objects, wrap in brackets if needed
-                if pattern == r"(\\s*\\{\\s*\"operation\":.*?\\}\\s*,?)+" and not potential_json_str.startswith('['):
-                     # Remove trailing comma if present and wrap in brackets
-                    potential_json_str = f"[{potential_json_str.strip().rstrip(',')}]"
-
-                logger.debug(f"Found potential direct JSON match with pattern: {pattern} (iteration {iteration_count})")
-                try:
-                    parsed = json.loads(potential_json_str)
-                    logger.debug(f"Successfully parsed direct JSON match: {potential_json_str[:100]}...")
-                    if parsed == {} or parsed == []:
-                        logger.info("Parsed direct JSON match resulted in empty object/array.")
-                        return [] # Explicit empty is valid
-                    return parsed
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse direct JSON match: {e}")
-                    # Continue searching with other patterns
-
-
-        # Handle Ollama's quoted JSON format with iteration check
-        iteration_count += 1
-        if iteration_count > max_iterations:
-            logger.error(f"JSON parsing exceeded max iterations ({max_iterations}) during quoted JSON handling")
-            return None
-            
-        if text.startswith('"') and text.endswith('"'):
-            try:
-                unescaped = json.loads(text) # Interpret as a JSON string
-                if isinstance(unescaped, str):
-                    try:
-                        parsed = json.loads(unescaped) # Parse the content
-                        logger.debug("Successfully parsed quoted JSON from Ollama")
-                        if parsed == {} or parsed == []: return []
-                        return parsed
-                    except json.JSONDecodeError as e:
-                        logger.warning(f"Failed to parse unescaped quoted JSON: {e}")
-            except json.JSONDecodeError: pass # Not a valid JSON string
-
-        # --- Stage 4: Final Checks and Failure ---
-
-        # Check for explicit empty array token after all attempts
-        iteration_count += 1
-        if iteration_count > max_iterations:
-            logger.error(f"JSON parsing exceeded max iterations ({max_iterations}) during final checks")
-            return None
-            
+        # Check for empty array indicator
         if "[]" in text.replace(" ", ""):
             logger.info("Detected '[]' token in LLM response after exhaustive parsing. Treating as empty list.")
             return []
-
-        # If all attempts failed
+        
+        # Update error counters
         self.error_counters["json_parse_errors"] += 1
-        # Point 8: Record timestamp for guard mechanism
         self.error_timestamps["json_parse_errors"].append(time.time())
-
         self._error_message = "json_parse_error"
-        logger.error(f"Failed to extract valid JSON from LLM response after all attempts (iterations: {iteration_count})")
-        logger.debug(f"Full text that failed JSON parsing: {text}") # Log full text on final failure
+        logger.error(f"Failed to extract valid JSON from LLM response after all attempts")
+        logger.debug(f"Full text that failed JSON parsing: {text}")
         return None
 
     def _calculate_memory_similarity(self, memory1: str, memory2: str) -> float:
-        """
-        Calculate similarity between two memory contents using a more robust method.
-        Returns a score between 0.0 (completely different) and 1.0 (identical).
-        """
         if not memory1 or not memory2:
             return 0.0
-
-        # Clean the memories - remove tags and normalize
         memory1_clean = re.sub(r"\[Tags:.*?\]\s*", "", memory1).lower().strip()
         memory2_clean = re.sub(r"\[Tags:.*?\]\s*", "", memory2).lower().strip()
-
-        # Handle exact matches quickly
         if memory1_clean == memory2_clean:
             return 1.0
-
-        # Handle near-duplicates with same meaning but minor differences
-        # Split into words and compare overlap
         words1 = set(re.findall(r"\b\w+\b", memory1_clean))
         words2 = set(re.findall(r"\b\w+\b", memory2_clean))
-
         if not words1 or not words2:
             return 0.0
-
-        # Calculate Jaccard similarity for word overlap
         intersection = len(words1.intersection(words2))
         union = len(words1.union(words2))
         jaccard = intersection / union if union > 0 else 0.0
-
-        # Use sequence matcher for more precise comparison
         seq_similarity = SequenceMatcher(None, memory1_clean, memory2_clean).ratio()
-
-        # Combine both metrics, weighting sequence similarity higher
-        combined_similarity = (0.4 * jaccard) + (0.6 * seq_similarity)
-
-        return combined_similarity
+        return (0.4 * jaccard) + (0.6 * seq_similarity)
         
     async def _calculate_embedding_similarity(self, memory1: str, memory2: str) -> float:
-        """
-        Calculate semantic similarity between two memory contents using embeddings.
-        Returns a score between 0.0 (completely different) and 1.0 (identical).
-        
-        This method uses the configured embedding provider (local or API)
-        and calculates cosine similarity for more accurate semantic matching.
-        """
         if not memory1 or not memory2:
             return 0.0
-            
-        # Clean the memories - remove tags and normalize
         memory1_clean = re.sub(r"\[Tags:.*?\]\\s*", "", memory1).lower().strip()
         memory2_clean = re.sub(r"\[Tags:.*?\]\\s*", "", memory2).lower().strip()
-        
-        # Handle exact matches quickly
         if memory1_clean == memory2_clean:
             return 1.0
-            
         try:
-            # Get embeddings using the main dispatcher function
             mem1_embedding = await self._get_embedding(memory1_clean)
             mem2_embedding = await self._get_embedding(memory2_clean)
-            
-            # Check if embeddings were successfully generated
             if mem1_embedding is None or mem2_embedding is None:
                 logger.warning("Could not generate embeddings for similarity calculation. Falling back to text-based similarity.")
-                # Fallback to text-based on failure
                 return self._calculate_memory_similarity(memory1, memory2)
-            
-            # Calculate cosine similarity (dot product of normalized vectors)
-            # _get_embedding should return normalized vectors
             similarity = float(np.dot(mem1_embedding, mem2_embedding))
-            
-            # Clamp similarity to [0, 1] just in case of float precision issues
-            similarity = max(0.0, min(1.0, similarity))
-            
-            return similarity
+            return max(0.0, min(1.0, similarity))
         except Exception as e:
             logger.error(f"Error calculating embedding similarity: {e}\n{traceback.format_exc()}")
-            # Fall back to text-based similarity on unexpected error
             logger.info("Falling back to text-based similarity due to unexpected error.")
             return self._calculate_memory_similarity(memory1, memory2)
 
@@ -6391,69 +3436,35 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             return True
         
         def find_candidates(self, signature: List[int]) -> Set[str]:
-            """
-            Find candidate memory IDs that might be similar to the given signature.
-            
-            Args:
-                signature: MinHash signature to find candidates for
-                
-            Returns:
-                Set of memory IDs that are candidates for similarity
-            """
             if len(signature) != self.signature_length:
-                # Adapt signature length if needed
                 if len(signature) > self.signature_length:
                     signature = signature[:self.signature_length]
                 else:
                     signature = signature + [0] * (self.signature_length - len(signature))
-            
             candidates = set()
-            
-            # Check each band for matches
             for band_idx in range(self.num_bands):
                 start_idx = band_idx * self.rows_per_band
                 end_idx = start_idx + self.rows_per_band
                 band_values = signature[start_idx:end_idx]
-                
                 band_hash = self._hash_band(band_values)
-                
                 if band_hash in self.bands[band_idx]:
                     candidates.update(self.bands[band_idx][band_hash])
-            
             return candidates
         
         def get_signature(self, memory_id: str) -> Optional[List[int]]:
-            """Get the stored signature for a memory ID."""
             return self.signatures.get(memory_id)
         
         def size(self) -> int:
-            """Get the number of signatures in the index."""
             return len(self.signatures)
         
         def clear(self) -> None:
-            """Clear all signatures from the index."""
             self.bands = [dict() for _ in range(self.num_bands)]
             self.signatures.clear()
             self.memory_ids.clear()
     
     def _get_lsh_index(self) -> 'LSHIndex':
-        """
-        Get or create the LSH index for efficient duplicate detection.
-        
-        Returns:
-            LSH index instance
-        """
-        # Initialize LSH index if not already done or if configuration changed
         expected_signature_length = self.valves.fingerprint_num_hashes
-        
-        if not hasattr(self, '_lsh_index') or \
-           getattr(self, '_cached_lsh_signature_length', 0) != expected_signature_length:
-            
-            # Calculate optimal LSH parameters based on signature length
-            # Rule of thumb: bands * rows_per_band = signature_length
-            # More bands = higher precision, fewer false positives
-            # More rows per band = higher recall, fewer false negatives
-            
+        if not hasattr(self, '_lsh_index') or getattr(self, '_cached_lsh_signature_length', 0) != expected_signature_length:
             if expected_signature_length >= 128:
                 num_bands = 16
                 rows_per_band = expected_signature_length // num_bands
@@ -6463,69 +3474,34 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             else:
                 num_bands = 4
                 rows_per_band = max(1, expected_signature_length // num_bands)
-            
             self._lsh_index = self.LSHIndex(num_bands=num_bands, rows_per_band=rows_per_band)
             self._cached_lsh_signature_length = expected_signature_length
-            
             logger.debug(f"Initialized LSH index with {num_bands} bands, {rows_per_band} rows per band")
-        
         return self._lsh_index
     
     def _populate_lsh_index(self, existing_memories: List[Dict[str, Any]]) -> None:
-        """
-        Populate the LSH index with existing memories.
-        
-        Args:
-            existing_memories: List of existing memory dictionaries
-        """
         lsh_index = self._get_lsh_index()
-        
-        # Clear and repopulate the index
         lsh_index.clear()
-        
         logger.debug(f"Populating LSH index with {len(existing_memories)} existing memories")
-        
         for memory in existing_memories:
             memory_id = memory.get("id")
             memory_content = memory.get("memory", "")
-            
             if memory_id and memory_content:
                 try:
-                    # Generate fingerprint for this memory
                     fingerprint = self._get_memory_fingerprint(memory_content)
-                    
-                    # Add to LSH index
                     lsh_index.add_signature(memory_id, fingerprint)
-                    
                 except Exception as e:
                     logger.warning(f"Failed to add memory {memory_id} to LSH index: {e}")
-        
-        logger.debug(f"LSH index populated with {lsh_index.size()} signatures")
     
     def _find_lsh_candidates(self, memory_content: str) -> Set[str]:
-        """
-        Find candidate memory IDs that might be duplicates using LSH.
-        
-        Args:
-            memory_content: Content of the new memory
-            
-        Returns:
-            Set of memory IDs that are candidates for duplicate checking
-        """
         try:
-            # Generate fingerprint for the new memory
             fingerprint = self._get_memory_fingerprint(memory_content)
-            
-            # Find candidates using LSH
             lsh_index = self._get_lsh_index()
             candidates = lsh_index.find_candidates(fingerprint)
-            
             logger.debug(f"LSH found {len(candidates)} candidates for similarity checking")
             return candidates
-            
         except Exception as e:
             logger.warning(f"Error in LSH candidate finding: {e}")
-            # Return empty set on error - will fall back to full comparison
             return set()
 
     # ----------------------------
@@ -6534,9 +3510,6 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
     
     @dataclass
     class DuplicateConfidenceScore:
-        """
-        Comprehensive confidence score for duplicate detection.
-        """
         fingerprint_similarity: float = 0.0
         text_similarity: float = 0.0
         embedding_similarity: float = 0.0
@@ -6545,38 +3518,16 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
         tag_overlap: float = 0.0
         temporal_proximity: float = 0.0
         content_type_match: float = 0.0
-        
-        # Aggregated scores
         combined_score: float = 0.0
-        confidence_level: str = "low"  # low, medium, high
-        
-        # Decision factors
+        confidence_level: str = "low"
         is_duplicate: bool = False
         primary_method: str = ""
         decision_factors: List[str] = field(default_factory=list)
     
-    def _calculate_enhanced_confidence_score(
-        self, 
-        new_content: str, 
-        existing_content: str,
-        new_memory_data: Dict[str, Any] = None,
-        existing_memory_data: Dict[str, Any] = None
-    ) -> DuplicateConfidenceScore:
-        """
-        Calculate comprehensive confidence score for duplicate detection.
-        
-        Args:
-            new_content: Content of the new memory
-            existing_content: Content of the existing memory
-            new_memory_data: Optional metadata for new memory
-            existing_memory_data: Optional metadata for existing memory
-            
-        Returns:
-            DuplicateConfidenceScore object with detailed analysis
-        """
+    def _calculate_enhanced_confidence_score(self, new_content: str, existing_content: str,
+                                           new_memory_data: Dict[str, Any] = None,
+                                           existing_memory_data: Dict[str, Any] = None) -> DuplicateConfidenceScore:
         score = self.DuplicateConfidenceScore()
-        
-        # Ensure we have memory data objects
         if new_memory_data is None:
             new_memory_data = {"content": new_content, "tags": []}
         if existing_memory_data is None:
@@ -6665,125 +3616,52 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             return score
     
     def _get_confidence_score_weights(self) -> Dict[str, float]:
-        """
-        Get weights for different similarity components.
-        
-        Returns:
-            Dictionary of component weights (should sum to 1.0)
-        """
-        # Default weights - can be made configurable via valves in the future
         if self.valves.use_fingerprinting and self.valves.use_embeddings_for_deduplication:
-            # All methods available - prefer fingerprinting and embeddings
-            return {
-                "fingerprint": 0.35,
-                "text": 0.15,
-                "embedding": 0.25,
-                "length": 0.10,
-                "tag": 0.05,
-                "temporal": 0.05,
-                "content_type": 0.05
-            }
+            return {"fingerprint": 0.35, "text": 0.15, "embedding": 0.25, "length": 0.10,
+                    "tag": 0.05, "temporal": 0.05, "content_type": 0.05}
         elif self.valves.use_fingerprinting:
-            # Fingerprinting available but not embeddings
-            return {
-                "fingerprint": 0.40,
-                "text": 0.25,
-                "embedding": 0.0,
-                "length": 0.15,
-                "tag": 0.08,
-                "temporal": 0.07,
-                "content_type": 0.05
-            }
+            return {"fingerprint": 0.40, "text": 0.25, "embedding": 0.0, "length": 0.15,
+                    "tag": 0.08, "temporal": 0.07, "content_type": 0.05}
         elif self.valves.use_embeddings_for_deduplication:
-            # Embeddings available but not fingerprinting
-            return {
-                "fingerprint": 0.0,
-                "text": 0.25,
-                "embedding": 0.40,
-                "length": 0.15,
-                "tag": 0.08,
-                "temporal": 0.07,
-                "content_type": 0.05
-            }
+            return {"fingerprint": 0.0, "text": 0.25, "embedding": 0.40, "length": 0.15,
+                    "tag": 0.08, "temporal": 0.07, "content_type": 0.05}
         else:
-            # Only text-based methods available
-            return {
-                "fingerprint": 0.0,
-                "text": 0.50,
-                "embedding": 0.0,
-                "length": 0.20,
-                "tag": 0.12,
-                "temporal": 0.10,
-                "content_type": 0.08
-            }
+            return {"fingerprint": 0.0, "text": 0.50, "embedding": 0.0, "length": 0.20,
+                    "tag": 0.12, "temporal": 0.10, "content_type": 0.08}
     
     def _calculate_temporal_similarity(self, new_data: Dict[str, Any], existing_data: Dict[str, Any]) -> float:
-        """
-        Calculate temporal similarity between two memories.
-        
-        Args:
-            new_data: New memory metadata
-            existing_data: Existing memory metadata
-            
-        Returns:
-            Temporal similarity score [0.0, 1.0]
-        """
         try:
-            # Extract timestamps if available
             new_timestamp = new_data.get("created_at") or new_data.get("timestamp")
             existing_timestamp = existing_data.get("created_at") or existing_data.get("timestamp")
-            
             if not new_timestamp or not existing_timestamp:
-                return 0.5  # Neutral score when timestamps unavailable
-            
-            # Parse timestamps
+                return 0.5
             if isinstance(new_timestamp, str):
                 new_time = datetime.fromisoformat(new_timestamp.replace('Z', '+00:00'))
             else:
                 new_time = new_timestamp
-            
             if isinstance(existing_timestamp, str):
                 existing_time = datetime.fromisoformat(existing_timestamp.replace('Z', '+00:00'))
             else:
                 existing_time = existing_timestamp
-            
-            # Calculate time difference
             time_diff = abs((new_time - existing_time).total_seconds())
-            
-            # Score based on time proximity (closer in time = higher score)
-            # Within 1 hour = 1.0, within 1 day = 0.5, within 1 week = 0.1, beyond = 0.0
-            if time_diff < 3600:  # 1 hour
+            if time_diff < 3600:
                 return 1.0
-            elif time_diff < 86400:  # 1 day
+            elif time_diff < 86400:
                 return 0.5
-            elif time_diff < 604800:  # 1 week
+            elif time_diff < 604800:
                 return 0.1
             else:
                 return 0.0
-            
         except Exception as e:
             logger.debug(f"Error calculating temporal similarity: {e}")
-            return 0.5  # Neutral score on error
+            return 0.5
     
     def _calculate_content_type_similarity(self, content1: str, content2: str) -> float:
-        """
-        Calculate content type similarity (e.g., both preferences, both facts, etc.).
-        
-        Args:
-            content1: First content string
-            content2: Second content string
-            
-        Returns:
-            Content type similarity score [0.0, 1.0]
-        """
         try:
-            # Define content type patterns
             preference_patterns = r'\b(like|love|prefer|enjoy|favorite|hate|dislike)\b'
             fact_patterns = r'\b(is|was|are|were|born|lives|works|studied)\b'
             goal_patterns = r'\b(want|plan|goal|intend|hope|wish|dream)\b'
             relationship_patterns = r'\b(friend|family|brother|sister|mother|father|spouse|partner)\b'
-            
-            # Check content types for both strings
             def get_content_type(text):
                 text_lower = text.lower()
                 types = []
@@ -6796,30 +3674,16 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                 if re.search(relationship_patterns, text_lower):
                     types.append("relationship")
                 return set(types) if types else {"general"}
-            
             types1 = get_content_type(content1)
             types2 = get_content_type(content2)
-            
-            # Calculate overlap
             intersection = len(types1.intersection(types2))
             union = len(types1.union(types2))
-            
             return intersection / union if union > 0 else 0.0
-            
         except Exception as e:
             logger.debug(f"Error calculating content type similarity: {e}")
-            return 0.5  # Neutral score on error
+            return 0.5
     
     def _classify_confidence_level(self, combined_score: float) -> str:
-        """
-        Classify confidence level based on combined score.
-        
-        Args:
-            combined_score: Combined similarity score [0.0, 1.0]
-            
-        Returns:
-            Confidence level: "low", "medium", or "high"
-        """
         if combined_score >= 0.85:
             return "high"
         elif combined_score >= 0.65:
@@ -6828,71 +3692,37 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             return "low"
     
     def _make_duplicate_decision(self, score: 'DuplicateConfidenceScore') -> tuple[bool, str, List[str]]:
-        """
-        Make final duplicate decision based on confidence score.
-        
-        Args:
-            score: DuplicateConfidenceScore object
-            
-        Returns:
-            Tuple of (is_duplicate, primary_method, decision_factors)
-        """
         decision_factors = []
-        
-        # Use adaptive thresholds based on available methods
         if self.valves.use_fingerprinting:
             fingerprint_threshold = self.valves.fingerprint_similarity_threshold
             if score.fingerprint_similarity >= fingerprint_threshold:
                 decision_factors.append(f"fingerprint_match_{score.fingerprint_similarity:.3f}")
                 return True, "fingerprint", decision_factors
-        
         if self.valves.use_embeddings_for_deduplication:
             embedding_threshold = self.valves.embedding_similarity_threshold
             if score.embedding_similarity >= embedding_threshold:
                 decision_factors.append(f"embedding_match_{score.embedding_similarity:.3f}")
                 return True, "embedding", decision_factors
-        
-        # Text similarity as fallback
         text_threshold = self.valves.similarity_threshold
         if score.text_similarity >= text_threshold:
             decision_factors.append(f"text_match_{score.text_similarity:.3f}")
             return True, "text", decision_factors
-        
-        # Check combined score with configurable threshold
         combined_threshold = self.valves.confidence_scoring_combined_threshold
         if score.combined_score >= combined_threshold:
             decision_factors.append(f"combined_match_{score.combined_score:.3f}")
             if score.confidence_level == "high":
                 decision_factors.append("high_confidence")
             return True, "combined", decision_factors
-        
-        # Not a duplicate
         decision_factors.append(f"no_match_combined_{score.combined_score:.3f}")
         return False, "no_match", decision_factors
 
-    async def get_relevant_memories(
-        self, current_message: str, user_id: str, user_timezone: str = None
-    ) -> List[Dict[str, Any]]:
-        """Get memories relevant to the current context"""
-        # Validate user_id
+    async def get_relevant_memories(self, current_message: str, user_id: str, user_timezone: str = None) -> List[Dict[str, Any]]:
         if not user_id:
             logger.error("get_relevant_memories called without user_id")
             raise ValueError("user_id is required for retrieving memories")
-        
-        # Ensure configuration persistence before retrieval
         if not self._ensure_configuration_persistence():
             logger.warning("Configuration persistence check failed in get_relevant_memories, but continuing with current config")
-            
         logger.debug(f"Getting relevant memories for user_id: {user_id}, message: {current_message[:50]}...")
-        
-        # --- RELOAD VALVES --- REMOVED
-        # Ensure we have the latest config potentially injected by OWUI
-        # try:
-        #     logger.debug("Reloading self.valves at start of get_relevant_memories")
-        #     self.valves = self.Valves(**getattr(self, "config", {}).get("valves", {}))
-        # except Exception as e:
-        #      logger.error(f"Error reloading valves in get_relevant_memories: {e}")
-        # --- END RELOAD --- REMOVED
 
         import time
 
@@ -6909,31 +3739,23 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                 logger.info("No existing memories found for relevance assessment")
                 return []
 
-            # --- Local vector similarity filtering ---
             vector_similarities = []
-            user_embedding = None # Initialize to handle potential errors
-            user_embedding_dim = None # NEW: Store dimension
+            user_embedding = None
+            user_embedding_dim = None
             try:
-                # Obtain embedding using unified dispatcher (local or API)
                 user_embedding = await self._get_embedding(current_message)
-
-                # Bail out early if embedding failed and LLM relevance is disabled
                 if user_embedding is None and not self.valves.use_llm_for_relevance:
                     logger.warning("Cannot calculate relevance — failed to generate embedding and LLM relevance is disabled.")
-                    return []  # Cannot proceed without either method
-                elif user_embedding is not None: # NEW: Get dimension if successful
+                    return []
+                elif user_embedding is not None:
                     user_embedding_dim = user_embedding.shape[0]
                     logger.debug(f"User message embedding dimension: {user_embedding_dim}")
-
             except Exception as e:
                 self.error_counters["embedding_errors"] += 1
-                logger.error(
-                    f"Error computing embedding for user message: {e}\n{traceback.format_exc()}"
-                )
-                # Decide fallback based on config
+                logger.error(f"Error computing embedding for user message: {e}\n{traceback.format_exc()}")
                 if not self.valves.use_llm_for_relevance:
                     logger.warning("Cannot calculate relevance due to embedding error and no LLM fallback.")
-                    return [] # Cannot proceed
+                    return []
 
             if user_embedding is not None:
                 # Calculate vector similarities only if user embedding was successful
@@ -6956,50 +3778,30 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
 
                     if mem_emb is not None:
                         try:
-                            # --- NEW: Dimension Check ---
                             if user_embedding_dim is not None and mem_emb.shape[0] != user_embedding_dim:
                                 logger.warning(f"Dimension mismatch for memory {mem_id} ({mem_emb.shape[0]} vs user {user_embedding_dim}) - removing from cache")
-                                # Remove the incompatible embedding from cache
                                 del self.memory_embeddings[mem_id]
-                                continue # Skip this memory
-
-                            # Cosine similarity (embeddings are normalized in _get_embedding)
+                                continue
                             sim = float(np.dot(user_embedding, mem_emb))
                             vector_similarities.append((sim, mem))
                         except Exception as e:
-                            logger.warning(
-                                f"Error calculating similarity for memory {mem_id}: {e}"
-                            )
-                            continue  # Skip this memory if calculation fails
+                            logger.warning(f"Error calculating similarity for memory {mem_id}: {e}")
+                            continue
                         else:
-                            logger.debug(
-                                f"No embedding available for memory {mem_id} even after attempted computation."
-                            )
+                            logger.debug(f"No embedding available for memory {mem_id} even after attempted computation.")
                     else:
-                        logger.debug(
-                            f"No embedding available for memory {mem_id} even after attempted computation."
-                        )
+                        logger.debug(f"No embedding available for memory {mem_id} even after attempted computation.")
 
-                # Sort by similarity descending
                 vector_similarities.sort(reverse=True, key=lambda x: x[0])
                 logger.info(f"Calculated vector similarities for {len(vector_similarities)} memories. Top 3 scores: {[round(x[0], 3) for x in vector_similarities[:3]]}")
-
-                # Debug thresholds used
                 logger.info(f"THRESHOLDS: vector_similarity_threshold={self.valves.vector_similarity_threshold}, relevance_threshold={self.valves.relevance_threshold}")
-
-                # Use a lower initial filter threshold to avoid double filtering issues
-                # The main relevance filtering happens later based on use_llm_for_relevance setting
                 initial_filter_threshold = min(0.3, self.valves.vector_similarity_threshold)
-                top_n = self.valves.top_n_memories # Note: This top_n is applied BEFORE deciding on LLM/Vector scoring.
+                top_n = self.valves.top_n_memories
                 filtered_by_vector = [mem for sim, mem in vector_similarities if sim >= initial_filter_threshold][:top_n]
-                logger.info(
-                    f"Initial vector filter selected {len(filtered_by_vector)} of {len(existing_memories)} memories (Initial threshold: {initial_filter_threshold}, Top N: {top_n})"
-                )
+                logger.info(f"Initial vector filter selected {len(filtered_by_vector)} of {len(existing_memories)} memories (Initial threshold: {initial_filter_threshold}, Top N: {top_n})")
             else:
-                 # If user_embedding failed and LLM fallback is disabled, we already returned.
-                 # If LLM fallback is enabled, proceed with all existing memories for LLM relevance check.
-                 logger.warning("User embedding failed, proceeding with all memories for potential LLM check.")
-                 filtered_by_vector = existing_memories # Pass all memories to LLM check if enabled
+                logger.warning("User embedding failed, proceeding with all memories for potential LLM check.")
+                filtered_by_vector = existing_memories
 
 
             # --- Decide Relevance Method ---
@@ -7670,6 +4472,325 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         confidence_part = f" [Confidence: {confidence_score:.2f}]" # Format to 2 decimal places
         return f"{tag_part}{content}{bank_part}{confidence_part}".strip()
 
+    def _handle_api_error(self, error_msg: str, provider_type: str, operation: str = "API") -> str:
+        """Consolidated error handling for API operations."""
+        formatted_msg = f"Error: {operation} ({provider_type}) - {error_msg}"
+        logger.error(formatted_msg)
+        return formatted_msg
+
+    def _handle_validation_error(self, field_name: str, value: any, expected_type: str = None) -> bool:
+        """Consolidated validation error handling."""
+        if expected_type:
+            logger.warning(f"Validation failed for {field_name}: expected {expected_type}, got {type(value)}")
+        else:
+            logger.warning(f"Validation failed for {field_name}: invalid value {value}")
+        return False
+
+    def _safe_execute_with_fallback(self, operation: callable, fallback_value: any = None, operation_name: str = "operation") -> any:
+        """Safely execute an operation with fallback value on exception."""
+        try:
+            return operation()
+        except Exception as e:
+            logger.warning(f"{operation_name} failed: {e}")
+            return fallback_value
+
+    async def _make_api_request_with_retry(self, 
+                                         api_url: str, 
+                                         data: dict, 
+                                         headers: dict,
+                                         provider_type: str,
+                                         max_retries: int = None,
+                                         retry_delay: float = None,
+                                         request_timeout: float = None) -> tuple[bool, dict]:
+        """
+        Unified API request method with retry logic for both LLM and embedding requests.
+        
+        Args:
+            api_url: API endpoint URL
+            data: Request payload
+            headers: Request headers
+            provider_type: Provider type for circuit breaker and logging
+            max_retries: Maximum retry attempts (defaults to valve setting)
+            retry_delay: Base delay between retries (defaults to valve setting)
+            request_timeout: Request timeout (defaults to valve setting)
+            
+        Returns:
+            Tuple of (success: bool, response_data: dict or error_message: str)
+        """
+        max_retries = max_retries or self.valves.max_retries
+        retry_delay = retry_delay or self.valves.retry_delay
+        request_timeout = request_timeout or self.valves.request_timeout
+        
+        # Check circuit breaker before attempting connection
+        if self._is_circuit_breaker_open(api_url, provider_type):
+            error_msg = f"Circuit breaker is open for {provider_type} at {api_url}. Endpoint temporarily unavailable."
+            logger.warning(error_msg)
+            return False, error_msg
+
+        # Ensure we have a valid aiohttp session
+        session = await self._get_aiohttp_session()
+        
+        for attempt in range(1, max_retries + 2):  # +2 because we start at 1 and want max_retries+1 attempts
+            logger.debug(f"API request attempt {attempt}/{max_retries+1} to {api_url}")
+            
+            try:
+                # Make the API call with timeout
+                timeout = aiohttp.ClientTimeout(total=request_timeout)
+                async with session.post(api_url, json=data, headers=headers, timeout=timeout) as response:
+                    logger.debug(f"API response status: {response.status}")
+                    
+                    if response.status == 200:
+                        # Success - parse response
+                        content_type = response.headers.get("content-type", "")
+                        
+                        if "application/x-ndjson" in content_type:
+                            # Handle NDJSON (Ollama may return this)
+                            raw_text = await response.text()
+                            logger.debug(f"Received NDJSON response length: {len(raw_text)}")
+                            
+                            last_json = None
+                            for line in raw_text.strip().splitlines():
+                                try:
+                                    last_json = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+                            
+                            if last_json is None:
+                                error_msg = "Could not decode NDJSON response"
+                                logger.error(error_msg)
+                                if attempt > max_retries:
+                                    return False, error_msg
+                                else:
+                                    continue
+                            
+                            response_data = last_json
+                        else:
+                            # Regular JSON
+                            response_data = await response.json()
+                        
+                        # Record success for circuit breaker
+                        self._record_circuit_breaker_success(api_url, provider_type)
+                        logger.debug(f"API request successful: {json.dumps(response_data)[:200]}...")
+                        return True, response_data
+                        
+                    else:
+                        # Handle error response
+                        error_text = await response.text()
+                        error_msg = f"API ({provider_type}) returned {response.status}: {error_text}"
+                        logger.warning(f"API error: {error_msg}")
+                        
+                        # Record failure for circuit breaker
+                        self._record_circuit_breaker_failure(api_url, provider_type)
+                        
+                        # Determine if retryable
+                        is_retryable = response.status in [429, 500, 502, 503, 504]
+                        
+                        if is_retryable and attempt <= max_retries:
+                            # Enhanced exponential backoff with jitter
+                            base_delay = retry_delay * (2 ** (attempt - 1))
+                            # More aggressive backoff for rate limiting
+                            if response.status == 429:
+                                jitter = random.uniform(0.5, 2.0)
+                            else:
+                                jitter = random.uniform(0.1, 1.0)
+                            
+                            sleep_time = base_delay + jitter
+                            logger.warning(f"Retrying in {sleep_time:.2f} seconds (status: {response.status})...")
+                            await asyncio.sleep(sleep_time)
+                            continue
+                        else:
+                            return False, error_msg
+                            
+            except asyncio.TimeoutError:
+                logger.warning(f"Attempt {attempt} failed: API request timed out")
+                self._record_circuit_breaker_failure(api_url, provider_type)
+                
+                if attempt <= max_retries:
+                    # Enhanced exponential backoff with jitter for timeouts
+                    base_delay = retry_delay * (2 ** (attempt - 1))
+                    jitter = random.uniform(0.1, 0.8)
+                    sleep_time = base_delay + jitter
+                    logger.warning(f"Retrying after timeout in {sleep_time:.2f} seconds...")
+                    await asyncio.sleep(sleep_time)
+                    continue
+                else:
+                    return False, "API request timed out after multiple retries"
+                    
+            except ClientError as e:
+                logger.warning(f"Attempt {attempt} failed: API connection error: {str(e)}")
+                self._record_circuit_breaker_failure(api_url, provider_type)
+                
+                if attempt <= max_retries:
+                    # Enhanced exponential backoff for connection errors
+                    base_delay = retry_delay * (2 ** (attempt - 1))
+                    jitter = random.uniform(0.2, 1.0)
+                    sleep_time = base_delay + jitter
+                    logger.warning(f"Retrying after connection error in {sleep_time:.2f} seconds...")
+                    await asyncio.sleep(sleep_time)
+                    continue
+                else:
+                    return False, f"API connection error after {max_retries} attempts: {str(e)}"
+                    
+            except Exception as e:
+                logger.error(f"Attempt {attempt} failed: Unexpected error during API request: {e}")
+                self._record_circuit_breaker_failure(api_url, provider_type)
+                
+                if attempt <= max_retries:
+                    # Generic retry for unexpected errors
+                    base_delay = retry_delay * (2 ** (attempt - 1))
+                    jitter = random.uniform(0.3, 1.2)
+                    sleep_time = base_delay + jitter
+                    logger.warning(f"Retrying after unexpected error in {sleep_time:.2f} seconds...")
+                    await asyncio.sleep(sleep_time)
+                    continue
+                else:
+                    return False, f"Unexpected API error after {max_retries} attempts: {str(e)}"
+        
+        return False, f"API request failed after {max_retries} attempts"
+
+    def _build_llm_request_payload(self, system_prompt: str, user_prompt: str, provider_type: str, 
+                                   model: str, provider_features: dict) -> dict:
+        """Build LLM request payload for specific provider type."""
+        if provider_type == "ollama":
+            return {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "options": {
+                    "temperature": 0.1,
+                    "top_p": 0.95,
+                    "top_k": 80,
+                    "num_predict": 2048,
+                    "format": "json",
+                },
+                "stream": False,
+            }
+        elif provider_type == "openai_compatible":
+            data = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0,
+                "top_p": 1,
+                "max_tokens": 1024,
+                "seed": 42,
+                "stream": False,
+            }
+            # Add JSON mode if supported
+            if provider_features.get("supports_json_mode", True):
+                data["response_format"] = {"type": "json_object"}
+            return data
+        elif provider_type == "gemini":
+            # Combine system prompt with user prompt for Gemini
+            combined_prompt = f"{system_prompt}\n\nUser: {user_prompt}\n\nPlease respond in valid JSON format."
+            
+            data = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": combined_prompt}
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "topP": 0.95,
+                    "maxOutputTokens": 1024,
+                    "stopSequences": [],
+                    "responseMimeType": "application/json"
+                },
+                "safetySettings": [
+                    {
+                        "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                        "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_HATE_SPEECH",
+                        "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_HARASSMENT",
+                        "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+                    },
+                    {
+                        "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                        "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+                    }
+                ]
+            }
+            
+            # Add system instruction for newer models
+            if "gemini-1.5" in model.lower() or "gemini-pro" in model.lower():
+                data["systemInstruction"] = {
+                    "parts": [
+                        {"text": system_prompt}
+                    ]
+                }
+                # Use only user prompt in contents when system instruction is provided
+                data["contents"][0]["parts"][0]["text"] = f"{user_prompt}\n\nPlease respond in valid JSON format."
+            
+            return data
+        else:
+            raise ValueError(f"Unsupported provider type: {provider_type}")
+
+    def _build_llm_request_headers(self, provider_type: str, api_key: Optional[str]) -> dict:
+        """Build headers for LLM requests."""
+        headers = {"Content-Type": "application/json"}
+        
+        if provider_type == "openai_compatible" and api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        elif provider_type == "gemini" and api_key:
+            headers["x-goog-api-key"] = api_key
+        
+        return headers
+
+    def _prepare_gemini_api_url(self, api_url: str, model: str, api_key: Optional[str]) -> str:
+        """Prepare Gemini API URL with proper format."""
+        if "generativelanguage.googleapis.com" not in api_url:
+            logger.warning(f"Gemini API URL should use generativelanguage.googleapis.com, got: {api_url}")
+            # Try to construct proper URL
+            if "chat/completions" in api_url or "v1/completions" in api_url:
+                model_for_url = model if model else "gemini-pro"
+                api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_for_url}:generateContent"
+                logger.info(f"Updated Gemini API URL to: {api_url}")
+        
+        # Add API key to URL if not already present and not in headers
+        if api_key and "key=" not in api_url:
+            api_url = f"{api_url}?key={api_key}"
+        
+        return api_url
+
+    def _extract_llm_response_content(self, response_data: dict, provider_type: str) -> Optional[str]:
+        """Extract content from LLM response based on provider type."""
+        if provider_type == "openai_compatible":
+            if (response_data.get("choices")
+                and response_data["choices"][0].get("message")
+                and response_data["choices"][0]["message"].get("content")):
+                return response_data["choices"][0]["message"]["content"]
+        elif provider_type == "gemini":
+            # Primary Gemini response format
+            if (response_data.get("candidates")
+                and len(response_data["candidates"]) > 0
+                and response_data["candidates"][0].get("content")
+                and response_data["candidates"][0]["content"].get("parts")
+                and len(response_data["candidates"][0]["content"]["parts"]) > 0
+                and response_data["candidates"][0]["content"]["parts"][0].get("text")):
+                return response_data["candidates"][0]["content"]["parts"][0]["text"]
+            # Fallback format
+            elif (response_data.get("choices")
+                and response_data["choices"][0].get("message")
+                and response_data["choices"][0]["message"].get("content")):
+                return response_data["choices"][0]["message"]["content"]
+        elif provider_type == "ollama":
+            if response_data.get("message") and response_data["message"].get("content"):
+                return response_data["message"]["content"]
+        
+        return None
+
     async def query_llm_with_retry(self, system_prompt: str, user_prompt: str) -> str:
         """Query LLM with retry logic, supporting multiple provider types.
 
@@ -7685,29 +4806,15 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         model = self.valves.llm_model_name
         api_url = self.valves.llm_api_endpoint_url
         api_key = self.valves.llm_api_key
-        max_retries = self.valves.max_retries
-        retry_delay = self.valves.retry_delay
 
-        logger.info(
-            f"LLM Query: Provider={provider_type}, Model={model}, URL={api_url}"
-        )
-        logger.debug(
-            f"System prompt length: {len(system_prompt)}, User prompt length: {len(user_prompt)}"
-        )
+        logger.info(f"LLM Query: Provider={provider_type}, Model={model}, URL={api_url}")
+        logger.debug(f"System prompt length: {len(system_prompt)}, User prompt length: {len(user_prompt)}")
 
-        # ---- Improvement #5: Track LLM call frequency ----
+        # Track LLM call frequency
         try:
-            # Use dict to avoid attribute errors if metrics removed/reset elsewhere
             self.metrics["llm_call_count"] = self.metrics.get("llm_call_count", 0) + 1
         except Exception as metric_err:
-            # Non-critical; log at DEBUG level to avoid clutter
             logger.debug(f"Unable to increment llm_call_count metric: {metric_err}")
-
-        # Check circuit breaker before attempting connection
-        if self._is_circuit_breaker_open(api_url, provider_type):
-            error_msg = f"Circuit breaker is open for {provider_type} at {api_url}. Endpoint temporarily unavailable."
-            logger.warning(error_msg)
-            return error_msg
 
         # Perform health check if enabled
         if self.valves.enable_health_checks:
@@ -7718,10 +4825,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 self._record_circuit_breaker_failure(api_url, provider_type)
                 return error_msg
 
-        # Ensure we have a valid aiohttp session
-        session = await self._get_aiohttp_session()
-
-        # Add the current datetime to system prompt for time awareness
+        # Add current datetime to system prompt for time awareness
         system_prompt_with_date = system_prompt
         try:
             now = self.get_formatted_datetime()
@@ -7730,16 +4834,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         except Exception as e:
             logger.warning(f"Could not add date to system prompt: {e}")
 
-        headers = {"Content-Type": "application/json"}
-
-        # Add API key if provided (required for OpenAI-compatible APIs)
-        if provider_type == "openai_compatible" and api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        elif provider_type == "gemini" and api_key:
-            # Gemini API uses API key as URL parameter or x-goog-api-key header
-            headers["x-goog-api-key"] = api_key
-
-        # Detect provider features for adaptive behavior (if enabled)
+        # Detect provider features for adaptive behavior
         provider_features = {}
         if self.valves.enable_feature_detection:
             try:
@@ -7761,366 +4856,77 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             }
             logger.debug("Feature detection disabled, using default capabilities")
 
-        for attempt in range(
-            1, max_retries + 2
-        ):  # +2 because we start at 1 and want max_retries+1 attempts
-            logger.debug(f"LLM query attempt {attempt}/{max_retries+1}")
-            try:
-                if provider_type == "ollama":
-                    # Prepare the request body for Ollama
-                    data = {
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": system_prompt_with_date},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        # Set some parameters to encourage consistent outputs
-                        "options": {
-                            "temperature": 0.1,  # Lower temperature for more deterministic responses
-                            "top_p": 0.95,  # Slightly constrain token selection
-                            "top_k": 80,  # Reasonable top_k value
-                            "num_predict": 2048,  # Reasonable length limit
-                            "format": "json",  # Request JSON format
-                        },
-                        # Disable streaming so we get a single JSON response; newer Ollama respects this flag.
-                        "stream": False,
-                    }
-                    logger.debug(f"Ollama request data: {json.dumps(data)[:500]}...")
-                elif provider_type == "openai_compatible":
-                    # Prepare the request body for OpenAI-compatible API
-                    data = {
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": system_prompt_with_date},
-                            {"role": "user", "content": user_prompt},
-                        ],
-                        "temperature": 0,
-                        "top_p": 1,
-                        "max_tokens": 1024,
-                        "seed": 42,
-                        "stream": False,
-                    }
-                    
-                    # Add JSON mode if supported
-                    if provider_features.get("supports_json_mode", True):
-                        data["response_format"] = {"type": "json_object"}
-                        logger.debug("JSON mode enabled for OpenAI-compatible API")
-                    else:
-                        logger.warning("JSON mode not supported, relying on prompt instructions")
-                    
-                    logger.debug(
-                        f"OpenAI-compatible request data: {json.dumps(data)[:500]}..."
-                    )
-                elif provider_type == "gemini":
-                    # Prepare the request body for Gemini API (using correct Google Generative Language API format)
-                    # Combine system prompt with user prompt since Gemini doesn't support system role in the same way
-                    combined_prompt = f"{system_prompt_with_date}\n\nUser: {user_prompt}\n\nPlease respond in valid JSON format."
-                    
-                    data = {
-                        "contents": [
-                            {
-                                "parts": [
-                                    {"text": combined_prompt}
-                                ]
-                            }
-                        ],
-                        "generationConfig": {
-                            "temperature": 0.1,  # Lower temperature for more deterministic responses
-                            "topP": 0.95,
-                            "maxOutputTokens": 1024,
-                            "stopSequences": [],
-                            "responseMimeType": "application/json"  # Request JSON response
-                        },
-                        "safetySettings": [
-                            {
-                                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                            },
-                            {
-                                "category": "HARM_CATEGORY_HATE_SPEECH",
-                                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                            },
-                            {
-                                "category": "HARM_CATEGORY_HARASSMENT",
-                                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                            },
-                            {
-                                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                                "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                            }
-                        ]
-                    }
-                    
-                    # Add system instruction if the model supports it
-                    if "gemini-1.5" in model.lower() or "gemini-pro" in model.lower():
-                        data["systemInstruction"] = {
-                            "parts": [
-                                {"text": system_prompt_with_date}
-                            ]
-                        }
-                        # Use only user prompt in contents when system instruction is provided
-                        data["contents"][0]["parts"][0]["text"] = f"{user_prompt}\n\nPlease respond in valid JSON format."
-                    
-                    logger.debug(
-                        f"Gemini request data: {json.dumps(data)[:500]}..."
-                    )
-                    
-                    # Update API URL to use correct Gemini endpoint format if needed
-                    if "generativelanguage.googleapis.com" not in api_url:
-                        logger.warning(f"Gemini API URL should use generativelanguage.googleapis.com, got: {api_url}")
-                        # Try to construct proper URL if it looks like a generic endpoint
-                        if "chat/completions" in api_url or "v1/completions" in api_url:
-                            # Default to gemini-pro if no model specified in URL
-                            model_for_url = model if model else "gemini-pro"
-                            api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_for_url}:generateContent"
-                            logger.info(f"Updated Gemini API URL to: {api_url}")
-                    
-                    # Add API key to URL if not already present and not in headers
-                    if api_key and "key=" not in api_url and "x-goog-api-key" not in headers:
-                        api_url = f"{api_url}?key={api_key}"
-                        # Remove from headers to avoid duplication
-                        headers.pop("x-goog-api-key", None)
-                else:
-                    error_msg = f"Unsupported provider type: {provider_type}"
-                    logger.error(error_msg)
-                    return error_msg
+        try:
+            # Build request payload using consolidated helper
+            data = self._build_llm_request_payload(system_prompt_with_date, user_prompt, provider_type, model, provider_features)
+            logger.debug(f"Request payload: {json.dumps(data)[:500]}...")
+            
+            # Build headers using consolidated helper
+            headers = self._build_llm_request_headers(provider_type, api_key)
+            
+            # Prepare Gemini URL if needed
+            if provider_type == "gemini":
+                api_url = self._prepare_gemini_api_url(api_url, model, api_key)
+                # Remove API key from headers if it's in URL to avoid duplication
+                if "key=" in api_url:
+                    headers.pop("x-goog-api-key", None)
 
-                # Log the API call attempt
-                logger.info(
-                    f"Making API request to {api_url} (attempt {attempt}/{max_retries+1})"
+        except ValueError as e:
+            error_msg = f"Unsupported provider type: {str(e)}"
+            logger.error(error_msg)
+            return error_msg
+
+        # Make API request using consolidated method
+        success, response_data = await self._make_api_request_with_retry(
+            api_url, data, headers, provider_type,
+            max_retries=self.valves.max_retries,
+            retry_delay=self.valves.retry_delay,
+            request_timeout=self.valves.request_timeout
+        )
+
+        if not success:
+            # response_data contains error message
+            error_msg = str(response_data)
+            
+            # Handle special feature-specific failures (like JSON mode)
+            if ("json_object" in error_msg.lower() or 
+                "response_format" in error_msg.lower() or
+                "invalid request" in error_msg.lower()) and provider_type in ["openai_compatible", "gemini"]:
+                
+                logger.warning(f"JSON mode failed for {provider_type}, retrying without JSON mode")
+                
+                # Rebuild payload without JSON mode
+                provider_features["supports_json_mode"] = False
+                data = self._build_llm_request_payload(system_prompt_with_date, user_prompt, provider_type, model, provider_features)
+                
+                # Retry once without JSON mode
+                success, response_data = await self._make_api_request_with_retry(
+                    api_url, data, headers, provider_type,
+                    max_retries=1,  # Just one retry for JSON mode fallback
+                    retry_delay=self.valves.retry_delay,
+                    request_timeout=self.valves.request_timeout
                 )
-
-                # Make the API call with dynamic timeout based on configuration
-                request_timeout = aiohttp.ClientTimeout(total=self.valves.request_timeout)
-                async with session.post(
-                    api_url, json=data, headers=headers, timeout=request_timeout
-                ) as response:
-                    # Log the response status
-                    logger.info(f"API response status: {response.status}")
-
-                    if response.status == 200:
-                        # Success - parse the response, handling both JSON and NDJSON
-                        content_type = response.headers.get("content-type", "")
-                        if "application/x-ndjson" in content_type:
-                            # Ollama may still return NDJSON even with stream=False; aggregate lines
-                            raw_text = await response.text()
-                            logger.debug(
-                                f"Received NDJSON response length: {len(raw_text)}"
-                            )
-                            last_json = None
-                            for line in raw_text.strip().splitlines():
-                                try:
-                                    last_json = json.loads(line)
-                                except json.JSONDecodeError:
-                                    continue
-                            if last_json is None:
-                                error_msg = "Could not decode NDJSON response from LLM"
-                                logger.error(error_msg)
-                                if attempt > max_retries:
-                                    return error_msg
-                                else:
-                                    continue
-                            data = last_json
-                        else:
-                            # Regular JSON
-                            data = await response.json()
-
-                        # Extract content based on provider type
-                        content = None
-
-                        # Log the raw response for debugging
-                        logger.debug(f"Raw API response: {json.dumps(data)[:500]}...")
-
-                        if provider_type == "openai_compatible":
-                            if (
-                                data.get("choices")
-                                and data["choices"][0].get("message")
-                                and data["choices"][0]["message"].get("content")
-                            ):
-                                content = data["choices"][0]["message"]["content"]
-                                logger.info(
-                                    f"Retrieved content from OpenAI-compatible response (length: {len(content)})"
-                                )
-                        elif provider_type == "gemini":
-                            # Gemini uses Google Generative Language API response format
-                            if (
-                                data.get("candidates")
-                                and len(data["candidates"]) > 0
-                                and data["candidates"][0].get("content")
-                                and data["candidates"][0]["content"].get("parts")
-                                and len(data["candidates"][0]["content"]["parts"]) > 0
-                                and data["candidates"][0]["content"]["parts"][0].get("text")
-                            ):
-                                content = data["candidates"][0]["content"]["parts"][0]["text"]
-                                logger.info(
-                                    f"Retrieved content from Gemini response (length: {len(content)})"
-                                )
-                            # Fallback for older response format or error handling
-                            elif (
-                                data.get("choices")
-                                and data["choices"][0].get("message")
-                                and data["choices"][0]["message"].get("content")
-                            ):
-                                content = data["choices"][0]["message"]["content"]
-                                logger.info(
-                                    f"Retrieved content from Gemini response (fallback format, length: {len(content)})"
-                                )
-                            else:
-                                # Log the response structure for debugging
-                                logger.warning(f"Unexpected Gemini response structure: {json.dumps(data, indent=2)[:1000]}...")
-                                
-                                # Check if there's an error in the response
-                                if data.get("error"):
-                                    error_msg = f"Gemini API error: {data['error'].get('message', 'Unknown error')}"
-                                    logger.error(error_msg)
-                                    if attempt > max_retries:
-                                        return error_msg
-                                    else:
-                                        continue
-                        elif provider_type == "ollama":
-                            if data.get("message") and data["message"].get("content"):
-                                content = data["message"]["content"]
-                                logger.info(
-                                    f"Retrieved content from Ollama response (length: {len(content)})"
-                                )
-
-                        if content:
-                            # Record success for circuit breaker
-                            self._record_circuit_breaker_success(api_url, provider_type)
-                            return content
-                        else:
-                            error_msg = f"Could not extract content from {provider_type} response format"
-                            logger.error(f"{error_msg}: {data}")
-
-                            # If we're on the last attempt, return the error message
-                            if attempt > max_retries:
-                                return error_msg
-                    else:
-                        # Handle error response
-                        error_text = await response.text()
-                        error_msg = f"Error: LLM API ({provider_type}) returned {response.status}: {error_text}"
-                        logger.warning(f"API error: {error_msg}")
-                        
-                        # Check for feature-specific failures and adapt
-                        if response.status == 400 and provider_type in ["openai_compatible", "gemini"]:
-                            # Check if JSON mode is causing the error
-                            if ("json_object" in error_text.lower() or 
-                                "response_format" in error_text.lower() or
-                                "invalid request" in error_text.lower()):
-                                
-                                logger.warning(f"JSON mode failed for {provider_type}, disabling feature")
-                                # Update provider features to disable JSON mode
-                                cache_key = f"{provider_type}_{api_url}"
-                                if hasattr(self, '_provider_features') and cache_key in self._provider_features:
-                                    self._provider_features[cache_key]["supports_json_mode"] = False
-                                
-                                # If this isn't the last attempt, retry without JSON mode
-                                if attempt <= max_retries:
-                                    logger.info(f"Retrying without JSON mode (attempt {attempt + 1})")
-                                    await asyncio.sleep(retry_delay)
-                                    continue
-
-                        # Record failure for circuit breaker tracking
-                        self._record_circuit_breaker_failure(api_url, provider_type)
-                        
-                        # Determine if we should retry based on status code
-                        is_retryable = response.status in [429, 500, 502, 503, 504]
-
-                        if is_retryable and attempt <= max_retries:
-                            # Enhanced exponential backoff with jitter
-                            base_delay = retry_delay * (2 ** (attempt - 1))
-                            # Add more jitter for rate limiting (429) vs server errors
-                            if response.status == 429:
-                                jitter = random.uniform(0.5, 2.0)  # More aggressive backoff for rate limits
-                            else:
-                                jitter = random.uniform(0.1, 1.0)  # Standard jitter for server errors
-                            
-                            sleep_time = base_delay + jitter
-                            logger.warning(f"Retrying in {sleep_time:.2f} seconds (status: {response.status})...")
-                            await asyncio.sleep(sleep_time)
-                            continue  # Retry
-                        else:
-                            return error_msg  # Final failure
-
-            except asyncio.TimeoutError:
-                logger.warning(f"Attempt {attempt} failed: LLM API request timed out")
-                self._record_circuit_breaker_failure(api_url, provider_type)
                 
-                if attempt <= max_retries:
-                    # Enhanced exponential backoff with jitter for timeouts
-                    base_delay = retry_delay * (2 ** (attempt - 1))
-                    jitter = random.uniform(0.1, 0.8)
-                    sleep_time = base_delay + jitter
-                    logger.warning(f"Retrying after timeout in {sleep_time:.2f} seconds...")
-                    await asyncio.sleep(sleep_time)
-                    continue  # Retry on timeout
-                else:
-                    return "Error: LLM API request timed out after multiple retries."
-            except ClientError as e:
-                logger.warning(
-                    f"Attempt {attempt} failed: LLM API connection error: {str(e)}"
-                )
-                self._record_circuit_breaker_failure(api_url, provider_type)
-                
-                # Run diagnostics on the final attempt to provide detailed troubleshooting info
-                if attempt > max_retries and self.valves.enable_connection_diagnostics:
-                    try:
-                        diagnostics = await self._diagnose_connection_issues(api_url, provider_type, e)
-                        tips = await self._get_connection_troubleshooting_tips(diagnostics)
-                        
-                        # Log detailed diagnostics
-                        logger.error(f"Connection diagnostics for {provider_type} at {api_url}:")
-                        logger.error(f"  Error: {diagnostics.get('error_message', 'Unknown')}")
-                        
-                        for test_name, test_result in diagnostics.get("tests", {}).items():
-                            if test_result.get("status") == "failed":
-                                logger.error(f"  {test_name}: {test_result.get('error', 'Failed')}")
-                            elif test_result.get("status") == "warnings":
-                                logger.warning(f"  {test_name}: {test_result.get('issues', [])}")
-                        
-                        if tips:
-                            logger.error("Troubleshooting suggestions:")
-                            for tip in tips:
-                                logger.error(f"  {tip}")
-                        
-                        # Return a more helpful error message with key tips
-                        if tips:
-                            key_tip = tips[0] if tips else "Check connection configuration"
-                            return f"Error: LLM_CONNECTION_FAILED - {key_tip}. See logs for full diagnostics."
-                        
-                    except Exception as diag_error:
-                        logger.warning(f"Failed to run connection diagnostics: {diag_error}")
-                
-                if attempt <= max_retries:
-                    # Enhanced exponential backoff for connection errors
-                    base_delay = retry_delay * (2 ** (attempt - 1))
-                    jitter = random.uniform(0.2, 1.0)
-                    sleep_time = base_delay + jitter
-                    logger.warning(f"Retrying after connection error in {sleep_time:.2f} seconds...")
-                    await asyncio.sleep(sleep_time)
-                    continue  # Retry on connection error
-                else:
-                    # Return specific error code for connection failure
-                    return f"Error: LLM_CONNECTION_FAILED after multiple retries: {str(e)}"
-            except Exception as e:
-                logger.error(
-                    f"Attempt {attempt} failed: Unexpected error during LLM query: {e}\n{traceback.format_exc()}"
-                )
-                self._record_circuit_breaker_failure(api_url, provider_type)
-                
-                if attempt <= max_retries:
-                    # Generic retry for unexpected errors with enhanced backoff
-                    base_delay = retry_delay * (2 ** (attempt - 1))
-                    jitter = random.uniform(0.3, 1.2)
-                    sleep_time = base_delay + jitter
-                    logger.warning(f"Retrying after unexpected error in {sleep_time:.2f} seconds...")
-                    await asyncio.sleep(sleep_time)
-                    continue
-                else:
-                    return f"Error: UNEXPECTED_LLM_ERROR after {max_retries} attempts: {str(e)}"
+                if not success:
+                    return f"Error: LLM API ({provider_type}) failed even without JSON mode: {response_data}"
+            else:
+                return f"Error: LLM API ({provider_type}) failed: {error_msg}"
 
-        return f"Error: LLM query failed after {max_retries} attempts."
-
+        # Extract content from response using consolidated helper
+        content = self._extract_llm_response_content(response_data, provider_type)
+        
+        if content:
+            logger.info(f"Successfully retrieved LLM response (length: {len(content)})")
+            return content
+        else:
+            error_msg = f"Could not extract content from {provider_type} response format"
+            logger.error(f"{error_msg}: {json.dumps(response_data)[:500]}...")
+            
+            # Check for Gemini-specific errors
+            if provider_type == "gemini" and response_data.get("error"):
+                error_msg = f"Gemini API error: {response_data['error'].get('message', 'Unknown error')}"
+            
+            return error_msg
     async def _add_confirmation_message(self, body: Dict[str, Any]) -> None:
         """Add a confirmation message about memory operations"""
         if (
@@ -8401,89 +5207,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             # Should never fail, but guard to avoid cascading errors
             logger.debug(f"_increment_error_counter failed for '{counter_name}': {e}")
 
-    # --- NEW Embedding Functions --- ADDED
-    async def _get_embedding_from_api(self, text: str) -> Optional[np.array]:
-        """Helper to get embedding from a configured OpenAI-compatible API."""
-        provider_type = self.valves.embedding_provider_type # Keep for check, but not used further
-        api_url = self.valves.embedding_api_url
-        api_key = self.valves.embedding_api_key
-        model_name = self.valves.embedding_model_name
-        max_retries = self.valves.max_retries # Reuse LLM retries for now
-        retry_delay = self.valves.retry_delay
-
-        if not api_url or not api_key:
-            logger.error("Attempted to call embedding API without proper URL or Key configuration.")
-            return None
-        if not text:
-            logger.debug("Skipping embedding API call for empty text.")
-            return None
-
-        logger.info(f"Getting embedding via API: URL={api_url}, Model={model_name}")
-        session = await self._get_aiohttp_session()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-        # Common OpenAI embedding request format
-        data = {
-            "input": text,
-            "model": model_name
-            # Add other API specific params like 'encoding_format': 'float' if needed
-        }
-
-        for attempt in range(1, max_retries + 2):
-            logger.debug(f"Embedding API request attempt {attempt}/{max_retries+1}")
-            try:
-                async with session.post(api_url, json=data, headers=headers, timeout=30) as response:
-                    logger.debug(f"Embedding API response status: {response.status}")
-                    if response.status == 200:
-                        response_data = await response.json()
-                        # Standard OpenAI format: {"object":"list","data":[{"object":"embedding","index":0,"embedding":[...]}],"model":"...","usage":{...}}
-                        if response_data.get("data") and isinstance(response_data["data"], list) and len(response_data["data"]) > 0:
-                            embedding_list = response_data["data"][0].get("embedding")
-                            if embedding_list and isinstance(embedding_list, list):
-                                logger.debug(f"Successfully received embedding vector of dimension {len(embedding_list)} from API.")
-                                return np.array(embedding_list, dtype=np.float32)
-                        logger.error(f"Could not extract embedding from API response format: {str(response_data)[:200]}...")
-                        return None # Invalid format
-                    else:
-                        error_text = await response.text()
-                        logger.warning(f"Embedding API returned error {response.status}: {error_text[:200]}... (Attempt {attempt})")
-                        is_retryable = response.status in [429, 500, 502, 503, 504]
-                        if is_retryable and attempt <= max_retries:
-                             sleep_time = retry_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
-                             logger.warning(f"Retrying embedding API call in {sleep_time:.2f} seconds...")
-                             await asyncio.sleep(sleep_time)
-                             continue
-                        else:
-                            logger.error(f"Non-retryable embedding API error or max retries reached.")
-                            return None # Non-retryable error or max retries exceeded
-
-            except asyncio.TimeoutError:
-                logger.warning(f"Embedding API request timed out (Attempt {attempt})")
-                if attempt <= max_retries:
-                    sleep_time = retry_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
-                    await asyncio.sleep(sleep_time)
-                    continue
-                else:
-                    logger.error("Embedding API request timed out after multiple retries.")
-                    return None
-            except ClientError as e:
-                 logger.warning(f"Embedding API connection error: {e} (Attempt {attempt})")
-                 if attempt <= max_retries:
-                    sleep_time = retry_delay * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
-                    await asyncio.sleep(sleep_time)
-                    continue
-                 else:
-                    logger.error("Embedding API connection error after multiple retries.")
-                    return None
-            except Exception as e:
-                logger.error(f"Unexpected error getting embedding from API: {e}\n{traceback.format_exc()}")
-                # Don't retry on unexpected errors during parsing/processing
-                return None # Return None on unexpected error
-        
-        logger.error(f"Embedding API query failed after {max_retries + 1} attempts.")
-        return None
+    # --- Consolidated Embedding Functions ---
 
     async def _get_embedding(self, text: str) -> Optional[np.array]:
         """Unified embedding getter with metrics and retries"""
@@ -8516,9 +5240,57 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     self.error_counters["embedding_errors"] += 1 # Count as error
             
             elif provider_type == "openai_compatible":
-                embedding_vector = await self._get_embedding_from_api(text)
-                if embedding_vector is None: # API call failed
-                     self.error_counters["embedding_errors"] += 1 # Count as error
+                # Use consolidated API request for embeddings
+                api_url = self.valves.embedding_api_url
+                api_key = self.valves.embedding_api_key
+                model_name = self.valves.embedding_model_name
+                
+                if not api_url or not api_key:
+                    logger.error("Attempted to call embedding API without proper URL or Key configuration.")
+                    self.error_counters["embedding_errors"] += 1
+                    embedding_vector = None
+                else:
+                    logger.info(f"Getting embedding via API: URL={api_url}, Model={model_name}")
+                    
+                    # Build embedding request payload
+                    data = {
+                        "input": text,
+                        "model": model_name
+                    }
+                    
+                    # Build headers
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {api_key}"
+                    }
+                    
+                    # Make API request using consolidated method
+                    success, response_data = await self._make_api_request_with_retry(
+                        api_url, data, headers, "embedding",
+                        max_retries=self.valves.max_retries,
+                        retry_delay=self.valves.retry_delay,
+                        request_timeout=30.0  # Shorter timeout for embeddings
+                    )
+                    
+                    if success:
+                        # Extract embedding from response
+                        if response_data.get("data") and isinstance(response_data["data"], list) and len(response_data["data"]) > 0:
+                            embedding_list = response_data["data"][0].get("embedding")
+                            if embedding_list and isinstance(embedding_list, list):
+                                logger.debug(f"Successfully received embedding vector of dimension {len(embedding_list)} from API.")
+                                embedding_vector = np.array(embedding_list, dtype=np.float32)
+                            else:
+                                logger.error(f"Could not extract embedding from API response format: {str(response_data)[:200]}...")
+                                embedding_vector = None
+                        else:
+                            logger.error(f"Could not extract embedding from API response format: {str(response_data)[:200]}...")
+                            embedding_vector = None
+                    else:
+                        logger.error(f"Embedding API request failed: {response_data}")
+                        embedding_vector = None
+                    
+                    if embedding_vector is None:
+                        self.error_counters["embedding_errors"] += 1
             
             else:
                 logger.error(f"Invalid embedding_provider_type configured: {provider_type}")
@@ -9104,53 +5876,5 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             return {"conflict_detection_enabled": True, "error": str(e)}
 
     def _register_orchestration_endpoints(self):
-        """Register API endpoints for filter orchestration"""
-        try:
-            # Get reference to the filter instance for closures
-            filter_instance = self
-            
-            @webui_app.get("/adaptive-memory/orchestration/metadata")
-            async def get_orchestration_metadata():
-                """Get filter metadata for orchestration"""
-                return filter_instance.get_filter_metadata()
-            
-            @webui_app.get("/adaptive-memory/orchestration/status")
-            async def get_orchestration_status():
-                """Get orchestration status and performance metrics"""
-                return filter_instance.get_orchestration_status()
-            
-            @webui_app.get("/adaptive-memory/orchestration/conflicts")
-            async def get_orchestration_conflicts():
-                """Get conflict detection report"""
-                return filter_instance.get_conflict_report()
-            
-            @webui_app.get("/adaptive-memory/orchestration/metrics")
-            async def get_orchestration_metrics():
-                """Get Prometheus metrics for filter orchestration"""
-                try:
-                    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-                    metrics_data = generate_latest()
-                    return Response(content=metrics_data, media_type=CONTENT_TYPE_LATEST)
-                except ImportError:
-                    return {"error": "Prometheus client not available"}
-                except Exception as e:
-                    return {"error": f"Failed to generate metrics: {str(e)}"}
-            
-            @webui_app.post("/adaptive-memory/orchestration/rollback")
-            async def trigger_orchestration_rollback(rollback_id: Optional[str] = None):
-                """Trigger a rollback operation"""
-                try:
-                    success = filter_instance._perform_rollback(rollback_id)
-                    return {
-                        "success": success,
-                        "rollback_id": rollback_id,
-                        "message": "Rollback completed" if success else "Rollback failed"
-                    }
-                except Exception as e:
-                    return {"success": False, "error": str(e)}
-            
-            logger.info("Registered orchestration API endpoints")
-            
-        except Exception as e:
-            logger.error(f"Failed to register orchestration endpoints: {e}")
+        pass  # Simplified - endpoints removed for single filter use
             # Continue without endpoints
