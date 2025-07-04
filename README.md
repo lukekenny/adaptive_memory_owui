@@ -1,148 +1,127 @@
-# OWUI Adaptive Memory Plugin v4.0
+# OpenWebUI Adaptive Memory Plugin v4.0
 
-A powerful memory management plugin for OpenWebUI that provides persistent, personalized memory capabilities for AI conversations.
+A monolithic OpenWebUI filter function that provides persistent memory capabilities for AI conversations, enabling personalized responses based on user history and preferences.
 
-## 🚀 What's New in v4.0
+## What's New in v4.0
 
-### Major Improvements
-- **36% Code Reduction**: Optimized from 9,156 to 5,853 lines while maintaining all functionality
-- **Enhanced Security**: Fixed critical vulnerabilities (CVE-2024-23334, CVE-2024-27306, CVE-2024-3772)
-- **Improved Reliability**: Centralized error handling with automatic recovery
-- **Better Small Model Support**: JSON repair system for sub-3B models
-- **Comprehensive Testing**: 95% error scenario coverage
-- **Easy Installation**: One-command verification with auto-fix capabilities
+- **36% Code Reduction**: Optimized from 9,156 to 5,853 lines while maintaining all features
+- **Security Fixes**: Updated dependencies to patch CVE-2024-3772, CVE-2024-23334, CVE-2024-27306
+- **JSON Repair System**: Added support for sub-3B models with improved JSON parsing
+- **Gemini API Fix**: Corrected authentication method for Gemini API integration
+- **Enhanced Error Handling**: Improved circuit breaker pattern for better fault tolerance
+- **Performance Optimizations**: Streamlined memory operations and reduced overhead
 
-### Key Features
-- ✅ **Persistent Memory**: Remembers user preferences, context, and information across sessions
-- ✅ **Smart Categorization**: Automatically organizes memories (identity, preferences, goals, relationships, possessions)
-- ✅ **Privacy-First**: Complete user isolation - memories never leak between users
-- ✅ **LLM Agnostic**: Works with Ollama, OpenAI-compatible APIs, and Google Gemini
-- ✅ **Intelligent Deduplication**: Prevents memory redundancy with smart similarity detection
-- ✅ **Background Processing**: Automatic memory summarization and cleanup
-- ✅ **Configurable**: 60+ settings to customize behavior
+## Installation
 
-## 📦 Installation
+OpenWebUI functions are installed by copying the code directly into the OpenWebUI interface:
 
-### Quick Install
+1. **Open OpenWebUI Admin Panel**
+   - Navigate to your OpenWebUI instance
+   - Login with admin credentials
 
-1. **Download the plugin**:
-   ```bash
-   git clone https://github.com/yourusername/owui-adaptive-memory.git
-   cd owui-adaptive-memory
-   ```
+2. **Add the Function**
+   - Go to "Workspace" → "Functions"
+   - Click the "+" button to add a new function
+   - Copy the entire contents of `adaptive_memory_v4.0.py`
+   - Paste into the code editor
+   - Click "Save"
 
-2. **Run the installer**:
-   ```bash
-   # Linux/macOS
-   ./install.sh
-   
-   # Windows
-   install.bat
-   ```
+3. **Enable the Filter**
+   - Toggle the switch to enable the function
+   - Go to "Workspace" → "Models"
+   - Select the models you want to use with adaptive memory
+   - Assign the filter to those models
 
-3. **Upload to OpenWebUI**:
-   - Go to Workspace → Functions
-   - Click "+" to add new function
-   - Upload `adaptive_memory_v4.0.py`
-   - Save and enable for your models
+4. **Configure Settings (Optional)**
+   - Click on the function name to access configuration
+   - Adjust settings like LLM provider, memory thresholds, etc.
+   - Save your configuration
 
-### Manual Installation
+## Testing the Installation
 
-1. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+After installation, test with simple statements:
+- "My favorite color is blue"
+- "I prefer Python over Java"
+- "I work as a software engineer"
 
-2. **Verify installation**:
-   ```bash
-   python quick_verify.py
-   ```
+The filter will extract and remember these preferences for future conversations.
 
-3. **Upload the plugin file** to OpenWebUI as described above
+## Features
 
-## 🔧 Configuration
+- **User-Specific Memory**: Each user has isolated memory storage
+- **Multi-LLM Support**: Works with Ollama, OpenAI-compatible APIs, and Gemini
+- **Automatic Memory Extraction**: Identifies and stores important information
+- **Context Injection**: Seamlessly adds relevant memories to conversations
+- **Flexible Memory Banks**: Organize memories by categories
+- **Deduplication**: Prevents duplicate memory storage
+- **Sub-3B Model Support**: JSON repair system for smaller models
 
-The plugin offers extensive configuration options through OpenWebUI's interface:
+## Configuration
 
-### Essential Settings
-- **Memory Capacity**: Max memories per user (default: 200)
-- **LLM Provider**: Choose between Ollama, OpenAI-compatible, or Gemini
-- **Similarity Threshold**: Control memory relevance (default: 0.7)
-- **Debug Logging**: Enable for troubleshooting
+The filter includes configurable valves for:
+- LLM provider settings (Ollama, OpenAI, Gemini)
+- Memory extraction thresholds
+- Maximum memories to inject
+- Debug logging options
+- Memory bank categories
 
-### Advanced Features
-- **Memory Summarization**: Automatic clustering and summarization of old memories
-- **Embedding Provider**: Local or API-based for similarity search
-- **Background Tasks**: Configurable intervals for maintenance
-- **Filter Orchestration**: Coordinate with other OpenWebUI filters
+## Requirements
 
-## 🛠️ Troubleshooting
+- OpenWebUI instance (latest version recommended)
+- Python 3.8+ (for OpenWebUI)
+- No additional installation steps required
 
-### Quick Diagnostics
-```bash
-# Check installation
-python quick_verify.py
+## File Structure
 
-# Full verification with auto-fix
-python post_install_verification.py --auto-fix
-
-# Test OpenWebUI integration
-python verify_openwebui_integration.py
+```
+adaptive_memory_v4.0.py    # Main filter file (copy this to OpenWebUI)
+requirements.txt           # Dependencies reference (for development only)
+tests/                     # Test suite (for development only)
 ```
 
-### Common Issues
+## Troubleshooting
 
-**LLM Connection Failed**:
-- Ensure your LLM provider is running
-- Check API URLs and keys in configuration
-- Use `/diagnose` command in chat for detailed diagnostics
+### Filter Not Working
+- Ensure the filter is enabled for your model
+- Check OpenWebUI logs for error messages
+- Verify the filter saved successfully without syntax errors
 
-**Memories Not Saving**:
-- Verify memory extraction is enabled
-- Check debug logs for errors
-- Ensure user context is properly detected
+### Memory Not Persisting
+- Check that the filter is processing messages (look for log entries)
+- Ensure the user is properly authenticated
+- Verify the model has the filter assigned
 
-**Installation Issues**:
-- Run `python post_install_verification.py --auto-fix`
-- Check Python version (requires 3.8+)
-- Verify all dependencies installed
+### Import Errors
+- The filter includes all necessary imports
+- If you see import errors, ensure you copied the complete file
+- Check that your OpenWebUI Python environment has basic packages
 
-## 📊 Performance
+## Development
 
-- **Memory Extraction**: < 100ms per message
-- **Memory Retrieval**: < 50ms for relevance search
-- **Overhead**: < 5% impact on response time
-- **Storage**: ~1KB per memory entry
+For development and testing:
+```bash
+# Install development dependencies
+pip install -r requirements.txt
 
-## 🔒 Security
+# Run tests
+python -m pytest tests/
+```
 
-- **CVE-2024-23334**: ✅ Fixed (aiohttp path traversal)
-- **CVE-2024-27306**: ✅ Fixed (aiohttp XSS)
-- **CVE-2024-3772**: ✅ Fixed (pydantic ReDoS)
-- **User Isolation**: Complete memory separation
-- **No Data Leakage**: Enforced at multiple levels
+## Security Notes
 
-## 🤝 Contributing
+- All user memories are isolated by user ID
+- No cross-user data access is possible
+- API keys should be configured securely in OpenWebUI
+- Dependencies have been updated to patch known vulnerabilities
 
-Contributions are welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Run tests: `pytest`
-4. Submit a pull request
+## License
 
-## 📝 License
+MIT License - See LICENSE file for details
 
-MIT License - see LICENSE file for details
+## Contributing
 
-## 🙏 Acknowledgments
-
-- OpenWebUI team for the excellent platform
-- Contributors and testers
-- Security researchers who reported vulnerabilities
-
----
-
-**Version**: 4.0.0  
-**Last Updated**: January 2024  
-**Compatibility**: OpenWebUI 0.1.0+  
-**Python**: 3.8+
+Contributions are welcome! Please ensure:
+- Code maintains the monolithic structure (single file)
+- All features remain functional
+- Tests pass successfully
+- Security best practices are followed
