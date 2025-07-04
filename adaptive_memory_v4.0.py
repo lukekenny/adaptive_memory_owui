@@ -494,23 +494,206 @@ class Filter:
     class Valves(BaseModel):
         
         model_config = {"extra": "forbid", "validate_assignment": True}
-        embedding_provider_type: Literal["local", "openai_compatible"] = Field(default="local", description="Type of embedding provider")
-        embedding_model_name: str = Field(default="all-MiniLM-L6-v2", description="Embedding model name")
-        embedding_api_url: Optional[str] = Field(default=None, description="Embedding API endpoint URL")
-        embedding_api_key: Optional[str] = Field(default=None, description="Embedding API Key")
-        enable_summarization_task: bool = Field(default=True, description="Enable memory summarization task")
-        summarization_interval: int = Field(default=7200, description="Summarization interval in seconds")
-        enable_error_logging_task: bool = Field(default=True, description="Enable error counter logging task")
-        error_logging_interval: int = Field(default=1800, description="Error logging interval in seconds")
-        enable_date_update_task: bool = Field(default=True, description="Enable date update task")
-        date_update_interval: int = Field(default=3600, description="Date update interval in seconds")
-        enable_model_discovery_task: bool = Field(default=True, description="Enable model discovery task")
-        model_discovery_interval: int = Field(default=7200, description="Model discovery interval in seconds")
-        summarization_min_cluster_size: int = Field(default=3, description="Min cluster size for summarization")
-        summarization_similarity_threshold: float = Field(default=0.7, description="Similarity threshold for clustering")
-        summarization_max_cluster_size: int = Field(default=8, description="Max memories per summarization batch")
-        summarization_min_memory_age_days: int = Field(default=7, description="Min age for summarization")
-        summarization_strategy: Literal["embeddings", "tags", "hybrid"] = Field(default="hybrid", description="Clustering strategy")
+        
+        # ================================================================
+        # 🎯 QUICK SETUP - Most users only need these 4 settings!
+        # ================================================================
+        
+        setup_mode: Literal["simple", "advanced"] = Field(
+            default="simple",
+            description="🎯 Configuration Mode: 'simple' = auto-configure everything (recommended), 'advanced' = full control"
+        )
+        
+        llm_provider: Literal["ollama", "openai_compatible", "gemini"] = Field(
+            default="ollama",
+            description="🤖 LLM Provider: 'ollama' = local Ollama, 'openai_compatible' = API services, 'gemini' = Google AI"
+        )
+        
+        llm_model_name: str = Field(
+            default="llama3:latest",
+            description="📝 Model Name: e.g., 'llama3:latest' (Ollama), 'gpt-4' (OpenAI), 'gemini-pro' (Google)"
+        )
+        
+        memory_mode: Literal["minimal", "balanced", "comprehensive"] = Field(
+            default="balanced", 
+            description="🧠 Memory Mode: 'minimal' = key facts only, 'balanced' = important info, 'comprehensive' = remember everything"
+        )
+        
+        # ================================================================
+        # 🔑 API CONFIGURATION (only for OpenAI/Gemini)
+        # ================================================================
+        
+        llm_api_key: Optional[str] = Field(
+            default=None,
+            description="🔑 API Key (required for OpenAI/Gemini): Get from your provider's dashboard"
+        )
+        
+        llm_api_endpoint_url: str = Field(
+            default="http://host.docker.internal:11434/api/chat",
+            description="🌐 API Endpoint: Full URL to your LLM service (auto-detected for most providers)"
+        )
+        
+        # ================================================================
+        # 🎛️ MEMORY BEHAVIOR
+        # ================================================================
+        
+        max_memories_to_remember: int = Field(
+            default=200,
+            description="💾 Maximum Memories: Total number of memories to keep per user (older ones are automatically removed)"
+        )
+        
+        memory_sensitivity: Literal["low", "medium", "high"] = Field(
+            default="medium",
+            description="🎚️ Memory Sensitivity: How easily new memories are created from conversations"
+        )
+        
+        show_memory_status: bool = Field(
+            default=True,
+            description="💬 Show Status Messages: Display 'Extracting memories...' and 'Found X memories' in chat"
+        )
+        
+        memories_to_inject: int = Field(
+            default=3,
+            description="🔄 Memories per Response: How many relevant memories to include in each AI response"
+        )
+        
+        relevance_threshold: float = Field(
+            default=0.6,
+            description="🎯 Relevance Threshold: Minimum similarity score (0.0-1.0) for memories to be included"
+        )
+        
+        similarity_threshold: float = Field(
+            default=0.85,
+            description="🔍 Duplicate Detection: Similarity threshold (0.0-1.0) to prevent storing duplicate memories"
+        )
+        
+        # ================================================================
+        # 🏛️ MEMORY ORGANIZATION
+        # ================================================================
+        
+        allowed_memory_banks: List[str] = Field(
+            default=["Personal", "Work", "Hobbies", "Technical"],
+            description="🗂️ Memory Categories: Organize memories into these categories"
+        )
+        
+        default_memory_bank: str = Field(
+            default="Personal",
+            description="🏠 Default Category: Where to store memories when category isn't specified"
+        )
+        
+        timezone: str = Field(
+            default="UTC",
+            description="🌍 Timezone: Your timezone for accurate time-based memories (e.g., 'America/New_York', 'Europe/London')"
+        )
+        
+        # ================================================================
+        # 🔧 TECHNICAL SETTINGS (expert users only)
+        # ================================================================
+        
+        embedding_provider_type: Literal["local", "openai_compatible"] = Field(
+            default="local", 
+            description="🔬 Embedding Provider: 'local' = built-in embeddings, 'openai_compatible' = API embeddings"
+        )
+        
+        embedding_model_name: str = Field(
+            default="all-MiniLM-L6-v2",
+            description="🧮 Embedding Model: Model name for generating text embeddings"
+        )
+        
+        embedding_api_url: Optional[str] = Field(
+            default=None,
+            description="🔗 Embedding API URL: Endpoint for external embedding service (if using API embeddings)"
+        )
+        
+        embedding_api_key: Optional[str] = Field(
+            default=None,
+            description="🔐 Embedding API Key: Authentication for external embedding service"
+        )
+        
+        # ================================================================
+        # 🏥 ADVANCED TUNING (expert level)
+        # ================================================================
+        
+        # Memory Processing
+        enable_json_stripping: bool = Field(default=True, description="🔧 Strip non-JSON text from LLM responses")
+        enable_fallback_regex: bool = Field(default=True, description="🔧 Use regex fallback for JSON parsing")
+        enable_short_preference_shortcut: bool = Field(default=True, description="🔧 Save short preference messages directly")
+        enable_feature_detection: bool = Field(default=True, description="🔧 Auto-detect LLM provider capabilities")
+        
+        # Memory Quality Control
+        filter_trivia: bool = Field(default=True, description="🚫 Filter out trivia and general knowledge")
+        min_memory_length: int = Field(default=8, description="📏 Minimum characters for valid memories")
+        min_confidence_threshold: float = Field(default=0.5, description="🎯 Minimum confidence score for memories")
+        blacklist_topics: Optional[str] = Field(default=None, description="🚫 Topics to never remember (comma-separated)")
+        whitelist_keywords: Optional[str] = Field(default=None, description="✅ Keywords that always create memories")
+        
+        # Memory Storage Management
+        pruning_strategy: Literal["fifo", "least_relevant"] = Field(default="fifo", description="🗂️ How to remove old memories")
+        max_injected_memory_length: int = Field(default=300, description="📝 Max characters per injected memory")
+        cache_ttl_seconds: int = Field(default=86400, description="⏰ Memory cache time-to-live")
+        
+        # Deduplication Settings
+        deduplicate_memories: bool = Field(default=True, description="🔄 Prevent duplicate memories")
+        use_embeddings_for_deduplication: bool = Field(default=True, description="🧮 Use AI embeddings for better duplicate detection")
+        embedding_similarity_threshold: float = Field(default=0.97, description="🎯 Embedding similarity for duplicates")
+        
+        # Advanced Processing
+        use_fingerprinting: bool = Field(default=True, description="🔍 Use content fingerprinting")
+        fingerprint_similarity_threshold: float = Field(default=0.8, description="🎯 Fingerprint similarity threshold")
+        use_llm_for_relevance: bool = Field(default=False, description="🤖 Use LLM for relevance scoring")
+        use_enhanced_confidence_scoring: bool = Field(default=True, description="📊 Enhanced confidence scoring")
+        
+        # Performance & Reliability
+        max_retries: int = Field(default=2, description="🔄 Max retry attempts for failed operations")
+        retry_delay: float = Field(default=1.0, description="⏱️ Delay between retries (seconds)")
+        request_timeout: float = Field(default=120.0, description="⏰ Request timeout (seconds)")
+        connection_timeout: float = Field(default=30.0, description="⏰ Connection timeout (seconds)")
+        
+        # Memory Maintenance
+        enable_summarization_task: bool = Field(default=True, description="📝 Enable automatic memory summarization")
+        summarization_interval: int = Field(default=7200, description="⏰ Summarization interval (seconds)")
+        summarization_min_cluster_size: int = Field(default=3, description="📊 Min memories for summarization")
+        summarization_similarity_threshold: float = Field(default=0.7, description="🎯 Similarity for grouping memories")
+        
+        # Error Handling
+        enable_error_counter_guard: bool = Field(default=True, description="🛡️ Enable error protection")
+        error_guard_threshold: int = Field(default=5, description="🚨 Max errors before protection")
+        error_guard_window_seconds: int = Field(default=600, description="⏰ Error counting window (seconds)")
+        
+        # ================================================================
+        # 🎨 UI & DISPLAY
+        # ================================================================
+        
+        show_memories: bool = Field(default=True, description="👁️ Show retrieved memories in responses")
+        memory_format: Literal["bullet", "paragraph", "numbered"] = Field(default="bullet", description="📝 Memory display format")
+        
+        # Memory Types to Track
+        enable_identity_memories: bool = Field(default=True, description="👤 Remember identity information")
+        enable_behavior_memories: bool = Field(default=True, description="🎭 Remember behavioral patterns")
+        enable_preference_memories: bool = Field(default=True, description="❤️ Remember preferences and likes")
+        enable_goal_memories: bool = Field(default=True, description="🎯 Remember goals and aspirations")
+        enable_relationship_memories: bool = Field(default=True, description="👥 Remember relationships")
+        enable_possession_memories: bool = Field(default=True, description="🏠 Remember possessions and ownership")
+        
+        # ================================================================
+        # 🤖 SYSTEM PROMPTS (expert level customization)
+        # ================================================================
+        
+        memory_identification_prompt: str = Field(
+            default='''Extract user-specific info as JSON array only. Format: [{"operation":"NEW","content":"text","tags":["list"],"memory_bank":"category","confidence":0.0-1.0}]. Extract: preferences, identity, goals, relationships, possessions, interests. Return only valid JSON array starting with [ and ending with ].''',
+            description="🤖 Prompt for extracting memories from conversations"
+        )
+        
+        memory_relevance_prompt: str = Field(
+            default="""Rate memory relevance 0-1 for user context. Only user-specific info rates high, not trivia. Return JSON: [{"memory":"text","id":"123","relevance":0.8}]""",
+            description="🤖 Prompt for rating memory relevance"
+        )
+        
+        memory_merge_prompt: str = Field(
+            default="""Merge similar user memories. Keep newer info if contradictory. Return JSON: ["merged memory text"]""",
+            description="🤖 Prompt for merging similar memories"
+        )
+        
         summarization_memory_prompt: str = Field(
             default="""You are a memory summarization assistant. Your task is to combine related memories about a user into a concise, comprehensive summary.
 
@@ -542,104 +725,80 @@ Good summary:
 "User is a coffee enthusiast who drinks 2-3 cups daily, particularly enjoying dark roast varieties in the morning."
 
 Analyze the following related memories and provide a concise summary.""",
-            description="System prompt for summarizing clusters of related memories"
+            description="🤖 Prompt for summarizing related memories"
         )
-        # ------ End Summarization Configuration ------
+
+        # Add missing fields that are used throughout the code
+        llm_provider_type: Literal["ollama", "openai_compatible", "gemini"] = Field(default="ollama")  # Hidden - mapped from llm_provider
+        recent_messages_n: int = Field(default=5)  # Hidden - based on memory_mode
+        related_memories_n: int = Field(default=5)  # Hidden - based on memory_mode
+        top_n_memories: int = Field(default=3)  # Hidden - based on memory_mode
+        vector_similarity_threshold: float = Field(default=0.45)  # Hidden - based on memory_mode
+        llm_skip_relevance_threshold: float = Field(default=0.93)  # Hidden - based on memory_mode
+        save_relevance_threshold: float = Field(default=0.8)  # Hidden - based on memory_mode
+        memory_threshold: float = Field(default=0.6)  # Hidden - based on memory_mode
+        max_total_memories: int = Field(default=200)  # Hidden - mapped from max_memories_to_remember
+        show_status: bool = Field(default=True)  # Hidden - mapped from show_memory_status
         
-        enable_json_stripping: bool = Field(default=True, description="Strip non-JSON text from LLM responses")
-        enable_fallback_regex: bool = Field(default=True, description="Use regex fallback for JSON parsing")
-        enable_short_preference_shortcut: bool = Field(default=True, description="Save short preference messages directly")
-        enable_feature_detection: bool = Field(
-            default=True,
-            description="Enable automatic detection of LLM provider capabilities for adaptive behavior and fallback mechanisms."
-        )
-        short_preference_no_dedupe_length: int = Field(default=100)
-        preference_keywords_no_dedupe: str = Field(default="favorite,love,like,prefer,enjoy")
-
-        blacklist_topics: Optional[str] = Field(default=None)
-        filter_trivia: bool = Field(default=True)
-        whitelist_keywords: Optional[str] = Field(default=None)
-
-        max_total_memories: int = Field(default=200)
-        pruning_strategy: Literal["fifo", "least_relevant"] = Field(default="fifo")
-        min_memory_length: int = Field(default=8)
-        min_confidence_threshold: float = Field(default=0.5)
-
-        recent_messages_n: int = Field(default=5)
-        save_relevance_threshold: float = Field(default=0.8)
-        max_injected_memory_length: int = Field(default=300)
-
-        llm_provider_type: Literal["ollama", "openai_compatible", "gemini"] = Field(default="ollama")
-        llm_model_name: str = Field(default="llama3:latest")
-        llm_api_endpoint_url: str = Field(default="http://host.docker.internal:11434/api/chat")
-        llm_api_key: Optional[str] = Field(default=None)
-
-        related_memories_n: int = Field(default=5)
-        relevance_threshold: float = Field(default=0.45)
-        memory_threshold: float = Field(default=0.6)
-
-        vector_similarity_threshold: float = Field(default=0.45)
-        llm_skip_relevance_threshold: float = Field(default=0.93)
-        top_n_memories: int = Field(default=3)
-        cache_ttl_seconds: int = Field(default=86400)
-
-        use_llm_for_relevance: bool = Field(default=False)
-        deduplicate_memories: bool = Field(default=True)
-        use_embeddings_for_deduplication: bool = Field(default=True)
-        embedding_similarity_threshold: float = Field(default=0.97)
-        similarity_threshold: float = Field(default=0.95)
-
-        use_fingerprinting: bool = Field(default=True)
-        fingerprint_similarity_threshold: float = Field(default=0.8)
+        # Advanced processing fields - only add missing ones
         fingerprint_num_hashes: int = Field(default=128)
         fingerprint_shingle_size: int = Field(default=3)
         use_lsh_optimization: bool = Field(default=True)
         lsh_threshold_for_activation: int = Field(default=100)
-        use_enhanced_confidence_scoring: bool = Field(default=True)
         confidence_scoring_combined_threshold: float = Field(default=0.7)
-
-        timezone: str = Field(
-            default="Asia/Dubai",
-            description="Timezone for date/time processing (e.g., 'America/New_York', 'Europe/London')",
-        )
-
-        # UI settings
-        show_status: bool = Field(
-            default=True, description="Show memory operations status in chat"
-        )
-        show_memories: bool = Field(default=True)
-        memory_format: Literal["bullet", "paragraph", "numbered"] = Field(default="bullet")
-        enable_identity_memories: bool = Field(default=True)
-        enable_behavior_memories: bool = Field(default=True)
-        enable_preference_memories: bool = Field(default=True)
-        enable_goal_memories: bool = Field(default=True)
-        enable_relationship_memories: bool = Field(default=True)
-        enable_possession_memories: bool = Field(default=True)
-        max_retries: int = Field(default=2)
-        retry_delay: float = Field(default=1.0)
-
-        memory_identification_prompt: str = Field(
-            default='''Extract user-specific info as JSON array only. Format: [{"operation":"NEW","content":"text","tags":["list"],"memory_bank":"category","confidence":0.0-1.0}]. Extract: preferences, identity, goals, relationships, possessions, interests. Return only valid JSON array starting with [ and ending with ].'''
-        )
-
-        memory_relevance_prompt: str = Field(
-            default="""Rate memory relevance 0-1 for user context. Only user-specific info rates high, not trivia. Return JSON: [{"memory":"text","id":"123","relevance":0.8}]"""
-        )
-
-        memory_merge_prompt: str = Field(
-            default="""Merge similar user memories. Keep newer info if contradictory. Return JSON: ["merged memory text"]"""
-        )
+        short_preference_no_dedupe_length: int = Field(default=100)
+        preference_keywords_no_dedupe: str = Field(default="favorite,love,like,prefer,enjoy")
+        
+        # Maintenance fields
+        enable_error_logging_task: bool = Field(default=True)
+        error_logging_interval: int = Field(default=1800)
+        enable_date_update_task: bool = Field(default=True)
+        date_update_interval: int = Field(default=3600)
+        enable_model_discovery_task: bool = Field(default=True)
+        model_discovery_interval: int = Field(default=7200)
+        summarization_max_cluster_size: int = Field(default=8)
+        summarization_min_memory_age_days: int = Field(default=7)
+        summarization_strategy: Literal["embeddings", "tags", "hybrid"] = Field(default="hybrid")
+        
+        # Connection and performance fields
+        max_concurrent_connections: int = Field(default=10)
+        connection_pool_size: int = Field(default=20)
+        enable_health_checks: bool = Field(default=True)
+        health_check_interval: int = Field(default=300)
+        circuit_breaker_failure_threshold: int = Field(default=5)
+        circuit_breaker_timeout: int = Field(default=60)
+        enable_connection_pooling: bool = Field(default=True)
+        connection_keepalive_timeout: int = Field(default=30)
+        dns_cache_ttl: int = Field(default=300)
+        enable_connection_diagnostics: bool = Field(default=True)
+        max_connection_retries: int = Field(default=3)
+        connection_retry_delay: float = Field(default=2.0)
+        
+        # Other missing fields
+        debug_error_counter_logs: bool = Field(default=False)
+        enable_filter_orchestration: bool = Field(default=True)
+        filter_execution_timeout_ms: int = Field(default=10000)
+        enable_conflict_detection: bool = Field(default=True)
+        enable_performance_monitoring: bool = Field(default=True)
+        filter_priority: Literal["highest", "high", "normal", "low", "lowest"] = Field(default="normal")
+        enable_rollback_mechanism: bool = Field(default=True)
+        max_concurrent_filters: int = Field(default=5)
+        coordination_overhead_threshold_ms: float = Field(default=100.0)
+        enable_shared_state: bool = Field(default=False)
+        filter_isolation_level: Literal["none", "partial", "full"] = Field(default="partial")
 
         @field_validator(
             'summarization_interval', 'error_logging_interval', 'date_update_interval',
             'model_discovery_interval', 'max_total_memories', 'min_memory_length',
             'recent_messages_n', 'related_memories_n', 'top_n_memories',
             'cache_ttl_seconds', 'max_retries', 'max_injected_memory_length',
-            'summarization_min_cluster_size', 'summarization_max_cluster_size', # Added
-            'summarization_min_memory_age_days', # Added
+            'summarization_min_cluster_size', 'summarization_max_cluster_size',
+            'summarization_min_memory_age_days', 'max_memories_to_remember', 'memories_to_inject',
             'max_concurrent_connections', 'connection_pool_size', 'health_check_interval',
             'circuit_breaker_failure_threshold', 'circuit_breaker_timeout',
             'connection_keepalive_timeout', 'dns_cache_ttl', 'max_connection_retries',
+            'fingerprint_num_hashes', 'fingerprint_shingle_size', 'lsh_threshold_for_activation',
+            'short_preference_no_dedupe_length', 'error_guard_threshold', 'error_guard_window_seconds'
         )
         def check_non_negative_int(cls, v, info):
             if not isinstance(v, int) or v < 0:
@@ -649,26 +808,17 @@ Analyze the following related memories and provide a concise summary.""",
         @field_validator(
             'save_relevance_threshold', 'relevance_threshold', 'memory_threshold',
             'vector_similarity_threshold', 'similarity_threshold',
-            'summarization_similarity_threshold',
-            'llm_skip_relevance_threshold',  # New field included
-            'embedding_similarity_threshold',  # Validate new embedding threshold as 0-1
-            'min_confidence_threshold',  # NEW: Validate confidence threshold as 0-1
-            check_fields=False
+            'summarization_similarity_threshold', 'llm_skip_relevance_threshold',
+            'embedding_similarity_threshold', 'min_confidence_threshold',
+            'fingerprint_similarity_threshold', 'confidence_scoring_combined_threshold'
         )
         def check_threshold_float(cls, v, info):
             """Ensure threshold values are between 0.0 and 1.0"""
             if not (0.0 <= v <= 1.0):
-                raise ValueError(
-                    f"{info.field_name} must be between 0.0 and 1.0. Received: {v}"
-                )
-            # Special documentation for similarity_threshold since it now has two usage contexts
-            if info.field_name == 'similarity_threshold':
-                logger.debug(
-                    f"Set similarity_threshold to {v} - this threshold is used for both text-based and embedding-based deduplication based on the 'use_embeddings_for_deduplication' setting."
-                )
+                raise ValueError(f"{info.field_name} must be between 0.0 and 1.0. Received: {v}")
             return v
 
-        @field_validator('retry_delay', 'request_timeout', 'connection_timeout', 'connection_retry_delay')
+        @field_validator('retry_delay', 'request_timeout', 'connection_timeout', 'connection_retry_delay', 'coordination_overhead_threshold_ms')
         def check_non_negative_float(cls, v, info):
             if not isinstance(v, float) or v < 0.0:
                 raise ValueError(f"{info.field_name} must be a non-negative float")
@@ -687,36 +837,76 @@ Analyze the following related memories and provide a concise summary.""",
         @field_validator('allowed_memory_banks')
         def validate_memory_banks(cls, v):
             if not isinstance(v, list) or not v:
-                return ["General", "Personal", "Work"]
+                return ["Personal", "Work", "Hobbies", "Technical"]
             valid_banks = [bank.strip() for bank in v if bank and isinstance(bank, str) and bank.strip()]
-            return valid_banks if valid_banks else ["General", "Personal", "Work"]
+            return valid_banks if valid_banks else ["Personal", "Work", "Hobbies", "Technical"]
         
         @field_validator('default_memory_bank')
-        def validate_default_memory_bank(cls, v, values):
-            return v.strip() if v and isinstance(v, str) and v.strip() else "General"
-        
+        def validate_default_memory_bank(cls, v):
+            return v.strip() if v and isinstance(v, str) and v.strip() else "Personal"
         
         @field_validator('llm_api_endpoint_url', 'embedding_api_url')
         def validate_api_urls(cls, v):
-            if v is None or not isinstance(v, str): return v
+            if v is None or not isinstance(v, str): 
+                return v
             v = v.strip()
             if v and not v.startswith(('http://', 'https://')):
                 raise ValueError(f"API URL must start with http:// or https://, got: {v}")
             return v
 
         @model_validator(mode="after")
-        def check_llm_config(self):
-            if self.llm_provider_type in ["openai_compatible", "gemini"] and not self.llm_api_key:
-                raise ValueError(f"API Key required for '{self.llm_provider_type}'")
-            if not self.llm_api_endpoint_url.startswith(("http://", "https://")):
-                raise ValueError("Invalid API endpoint URL")
+        def auto_configure_based_on_setup_mode(self):
+            """Auto-configure settings based on setup_mode and memory_mode"""
+            # Map llm_provider to llm_provider_type for internal use
+            self.llm_provider_type = self.llm_provider
+            
+            # Map UI fields to internal fields
+            self.max_total_memories = self.max_memories_to_remember
+            self.show_status = self.show_memory_status
+            
+            # Auto-configure API endpoints based on provider
+            if self.llm_provider == "ollama" and self.llm_api_endpoint_url == "http://host.docker.internal:11434/api/chat":
+                # Keep default for Ollama
+                pass
+            elif self.llm_provider == "openai_compatible" and not self.llm_api_key:
+                raise ValueError("🔑 API Key required for OpenAI-compatible providers")
+            elif self.llm_provider == "gemini" and not self.llm_api_key:
+                raise ValueError("🔑 API Key required for Google Gemini")
+            
+            # Auto-configure settings based on memory_mode if in simple setup
+            if self.setup_mode == "simple":
+                if self.memory_mode == "minimal":
+                    self.memories_to_inject = 1
+                    self.max_memories_to_remember = 50
+                    self.memory_sensitivity = "low"
+                    self.relevance_threshold = 0.8
+                    self.vector_similarity_threshold = 0.7
+                elif self.memory_mode == "comprehensive":
+                    self.memories_to_inject = 5
+                    self.max_memories_to_remember = 500
+                    self.memory_sensitivity = "high"
+                    self.relevance_threshold = 0.4
+                    self.vector_similarity_threshold = 0.3
+                # balanced mode uses defaults
+            
+            # Map memory_sensitivity to internal thresholds
+            if self.memory_sensitivity == "low":
+                self.save_relevance_threshold = 0.9
+                self.min_confidence_threshold = 0.7
+            elif self.memory_sensitivity == "high":
+                self.save_relevance_threshold = 0.6
+                self.min_confidence_threshold = 0.3
+            else:  # medium
+                self.save_relevance_threshold = 0.8
+                self.min_confidence_threshold = 0.5
+            
             return self
         
         @model_validator(mode="after")
         def check_embedding_config(self):
             if self.embedding_provider_type == "openai_compatible":
                 if not self.embedding_api_key or not self.embedding_api_url:
-                    raise ValueError("API Key and URL required for openai_compatible embedding")
+                    raise ValueError("🔧 API Key and URL required for OpenAI-compatible embeddings")
             return self
         
         @model_validator(mode="after")
@@ -724,39 +914,6 @@ Analyze the following related memories and provide a concise summary.""",
             if self.default_memory_bank not in self.allowed_memory_banks:
                 self.default_memory_bank = self.allowed_memory_banks[0]
             return self
-        
-
-        debug_error_counter_logs: bool = Field(default=False)
-        allowed_memory_banks: List[str] = Field(default=["General", "Personal", "Work"])
-        default_memory_bank: str = Field(default="General")
-        enable_error_counter_guard: bool = Field(default=True)
-        error_guard_threshold: int = Field(default=5)
-        error_guard_window_seconds: int = Field(default=600)
-
-        enable_filter_orchestration: bool = Field(default=True, description="Enable filter orchestration")
-        filter_execution_timeout_ms: int = Field(default=10000)
-        enable_conflict_detection: bool = Field(default=True)
-        enable_performance_monitoring: bool = Field(default=True)
-        filter_priority: Literal["highest", "high", "normal", "low", "lowest"] = Field(default="normal")
-        enable_rollback_mechanism: bool = Field(default=True)
-        max_concurrent_filters: int = Field(default=5)
-        coordination_overhead_threshold_ms: float = Field(default=100.0)
-        enable_shared_state: bool = Field(default=False)
-        filter_isolation_level: Literal["none", "partial", "full"] = Field(default="partial")
-        request_timeout: float = Field(default=120.0, description="Request timeout in seconds")
-        connection_timeout: float = Field(default=30.0, description="Connection timeout in seconds")
-        max_concurrent_connections: int = Field(default=10, description="Max concurrent connections")
-        connection_pool_size: int = Field(default=20, description="Connection pool size")
-        enable_health_checks: bool = Field(default=True, description="Enable health checks")
-        health_check_interval: int = Field(default=300, description="Health check interval")
-        circuit_breaker_failure_threshold: int = Field(default=5, description="Circuit breaker threshold")
-        circuit_breaker_timeout: int = Field(default=60, description="Circuit breaker timeout")
-        enable_connection_pooling: bool = Field(default=True, description="Enable connection pooling")
-        connection_keepalive_timeout: int = Field(default=30, description="Keep-alive timeout")
-        dns_cache_ttl: int = Field(default=300, description="DNS cache TTL")
-        enable_connection_diagnostics: bool = Field(default=True, description="Enable diagnostics")
-        max_connection_retries: int = Field(default=3, description="Max retry attempts")
-        connection_retry_delay: float = Field(default=2.0, description="Retry delay")
 
 
     class UserValves(BaseModel):
