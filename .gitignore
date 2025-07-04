@@ -24,9 +24,15 @@ node_modules/
 # OS specific
 .DS_Store
 
-# Task files
-# tasks.json
-# tasks/
+# Task management and development tools (not needed for OpenWebUI functions)
+.taskmaster/
+test*/
+*test*.py
+pytest.ini
+run_*.py
+validate_*.py
+*_validation.py
+*_diagnostics.py
 
 # Python Testing and Development
 __pycache__/
