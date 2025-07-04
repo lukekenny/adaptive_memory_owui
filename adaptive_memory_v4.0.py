@@ -49,17 +49,17 @@ except ImportError:
             except json.JSONDecodeError as e:
                 return JSONRepairResult(None, False, str(e))
         
-        def parse_with_repair(self, json_str: str) -> tuple[bool, dict]:
+        def parse_with_repair(self, json_str: str, **kwargs) -> 'JSONRepairResult':
             try:
                 import json
-                return True, json.loads(json_str)
-            except:
-                return False, {}
+                return JSONRepairResult(json.loads(json_str), True, "")
+            except json.JSONDecodeError as e:
+                return JSONRepairResult(None, False, str(e))
         
         def repair_json(self, json_str: str) -> str:
             return json_str
         
-        def validate_memory_operations(self, data: dict) -> bool:
+        def validate_memory_operations(self, data: Any) -> bool:
             """Validate memory operations format"""
             if not isinstance(data, list):
                 return False
@@ -75,6 +75,9 @@ except ImportError:
             self.data = data
             self.success = success
             self.error = error
+            self.parsed_data = data  # Alias for data
+            self.repair_method = "basic_parse" if success else "failed"
+            self.validation_errors = [] if success else [error]
 
 # ============================================================================
 # Global Variables and Mock Objects
@@ -550,8 +553,8 @@ class MemoryOperation(BaseModel):
 
 class Filter:
     _embedding_model = None
-    _memory_embeddings = {}
-    _relevance_cache = {}
+    _memory_embeddings: Dict[str, np.ndarray] = {}
+    _relevance_cache: Dict[str, float] = {}
 
     @property
     def _local_embedding_model(self): # RENAMED from embedding_model
@@ -1218,7 +1221,7 @@ Analyze the following related memories and provide a concise summary.""",
         except:
             self.valves = self.Valves()
 
-        self.stored_memories = None
+        self.stored_memories: List[Dict[str, Any]] = []
         self._error_message = None # Stores the reason for the last failure (e.g., json_parse_error)
         self._aiohttp_session = None
 
@@ -1239,6 +1242,10 @@ Analyze the following related memories and provide a concise summary.""",
 
         self.available_ollama_models = []
         self.available_openai_models = []
+        
+        # API version detection
+        self._api_version_info: Optional[Dict[str, Any]] = None
+        self._version_detection_count: int = 0
         self.available_local_embedding_models = []
         self.current_date = datetime.now()
         self.date_info = self._update_date_info()
@@ -1383,7 +1390,7 @@ Analyze the following related memories and provide a concise summary.""",
 
     async def _find_memory_clusters(self, memories: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
         """Find clusters of related memories based on configured strategy."""
-        clusters = []
+        clusters: List[List[Dict[str, Any]]] = []
         processed_ids = set()
         strategy = self.valves.summarization_strategy
         threshold = self.valves.summarization_similarity_threshold
@@ -1812,7 +1819,7 @@ Analyze the following related memories and provide a concise summary.""",
         if not hasattr(self, 'memory_processing_circuit_open'):
             self.memory_processing_circuit_open = False
             self.memory_processing_failures = 0
-            self.memory_processing_circuit_reset_time = 0
+            self.memory_processing_circuit_reset_time = 0.0
             
         current_time = time.time()
         
@@ -1896,7 +1903,7 @@ Analyze the following related memories and provide a concise summary.""",
     
     async def _diagnose_connection_issues(self, api_url: str, provider_type: str, error: Exception) -> Dict[str, Any]:
         key = self._get_circuit_breaker_key(api_url, provider_type)
-        diagnostics = {"endpoint": api_url, "provider": provider_type, "error_type": type(error).__name__, "error_message": str(error), "timestamp": time.time(), "tests": {}}
+        diagnostics: Dict[str, Any] = {"endpoint": api_url, "provider": provider_type, "error_type": type(error).__name__, "error_message": str(error), "timestamp": time.time(), "tests": {}}
         if not self.valves.enable_connection_diagnostics:
             diagnostics["tests"]["diagnostics_disabled"] = True
             return diagnostics
@@ -1937,7 +1944,7 @@ Analyze the following related memories and provide a concise summary.""",
         return tips
     
     def reset_circuit_breakers(self, api_url: Optional[str] = None, provider_type: Optional[str] = None) -> Dict[str, Any]:
-        reset_info = {"reset_count": 0, "reset_endpoints": []}
+        reset_info: Dict[str, Any] = {"reset_count": 0, "reset_endpoints": []}
         if api_url and provider_type:
             key = self._get_circuit_breaker_key(api_url, provider_type)
             if key in self._circuit_breaker_state:
@@ -2191,11 +2198,13 @@ Analyze the following related memories and provide a concise summary.""",
                             form_data=QueryMemoryForm(query=memory_id, k=1000) # Query broadly first
                         )
                         target_memory = None
-                        if query_result and hasattr(query_result, 'memories') and query_result.memories:
-                            for mem in query_result.memories:
-                                if hasattr(mem, 'id') and mem.id == memory_id:
-                                    target_memory = mem
-                                    break
+                        if query_result and hasattr(query_result, 'memories'):
+                            memories = getattr(query_result, 'memories', [])
+                            if memories:
+                                for mem in memories:
+                                    if hasattr(mem, 'id') and getattr(mem, 'id', None) == memory_id:
+                                        target_memory = mem
+                                        break
 
                         if not target_memory:
                             await self._safe_emit(__event_emitter__, {"type": "error", "content": f"Memory with ID '{memory_id}' not found."})
@@ -4004,11 +4013,11 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             self.signature_length = num_bands * rows_per_band
             
             # Hash tables for each band
-            self.bands = [dict() for _ in range(num_bands)]
+            self.bands: List[Dict[int, Set[str]]] = [dict() for _ in range(num_bands)]
             
             # Store original signatures by memory ID
-            self.signatures = {}  # memory_id -> signature
-            self.memory_ids = set()  # Track all memory IDs
+            self.signatures: Dict[str, List[int]] = {}  # memory_id -> signature
+            self.memory_ids: Set[str] = set()  # Track all memory IDs
             
         def _hash_band(self, band_values: List[int]) -> int:
             """Hash a band's values to create a bucket key."""
@@ -5083,7 +5092,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             # Invalidate cache entries involving this memory
             mem_emb = self.memory_embeddings.get(operation.id)
             if mem_emb is not None:
-                keys_to_delete = []
+                keys_to_delete: List[str] = []
                 for key, (score, ts) in self.relevance_cache.items():
                     # key is hash of (user_emb, mem_emb)
                     # We can't extract mem_emb from key, so approximate by deleting all keys with this mem_emb
@@ -5140,7 +5149,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             logger.warning(f"Validation failed for {field_name}: invalid value {value}")
         return False
 
-    def _safe_execute_with_fallback(self, operation: callable, fallback_value: any = None, operation_name: str = "operation") -> any:
+    def _safe_execute_with_fallback(self, operation: Callable, fallback_value: Any = None, operation_name: str = "operation") -> Any:
         """Safely execute an operation with fallback value on exception."""
         try:
             return operation()
@@ -5234,16 +5243,16 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         
                         # Log specific exceptions based on status code
                         if response.status == 401:
-                            error = LLMAuthenticationError(provider=provider_type, status_code=response.status)
-                            log_exception(logger, error)
+                            auth_error = LLMAuthenticationError(provider=provider_type, status_code=response.status)
+                            log_exception(logger, auth_error)
                         elif response.status == 503:
                             retry_after = response.headers.get('Retry-After')
-                            error = LLMServiceUnavailableError(
+                            service_error = LLMServiceUnavailableError(
                                 provider=provider_type, 
                                 status_code=response.status,
                                 retry_after=int(retry_after) if retry_after and retry_after.isdigit() else None
                             )
-                            log_exception(logger, error)
+                            log_exception(logger, service_error)
                         else:
                             logger.warning(f"API error: {error_msg}")
                         
@@ -5270,12 +5279,12 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                             return False, error_msg
                             
             except asyncio.TimeoutError:
-                error = LLMTimeoutError(
+                timeout_error = LLMTimeoutError(
                     provider=provider_type,
                     timeout_seconds=30.0,  # Default timeout
                     endpoint=api_url
                 )
-                log_exception(logger, error, level="warning")
+                log_exception(logger, timeout_error, level="warning")
                 self._record_circuit_breaker_failure(api_url, provider_type)
                 
                 if attempt <= max_retries:
@@ -5287,7 +5296,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     await asyncio.sleep(sleep_time)
                     continue
                 else:
-                    raise error
+                    raise timeout_error
                     
             except ClientError as e:
                 logger.warning(f"Attempt {attempt} failed: API connection error: {str(e)}")
@@ -5361,7 +5370,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             # Combine system prompt with user prompt for Gemini
             combined_prompt = f"{system_prompt}\n\nUser: {user_prompt}\n\nPlease respond in valid JSON format."
             
-            data = {
+            data: Dict[str, Any] = {
                 "contents": [
                     {
                         "parts": [
@@ -5404,7 +5413,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     ]
                 }
                 # Use only user prompt in contents when system instruction is provided
-                data["contents"][0]["parts"][0]["text"] = f"{user_prompt}\n\nPlease respond in valid JSON format."
+                if isinstance(data["contents"], list) and isinstance(data["contents"][0], dict):
+                    data["contents"][0]["parts"][0]["text"] = f"{user_prompt}\n\nPlease respond in valid JSON format."
             
             return data
         else:
@@ -5627,7 +5637,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             update_count = 0
             delete_count = 0
 
-            for memory in self.stored_memories:
+            for memory in (self.stored_memories or []):
                 if memory["operation"] == "NEW":
                     new_count += 1
                 elif memory["operation"] == "UPDATE":
@@ -5888,7 +5898,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
 
     # --- Consolidated Embedding Functions ---
 
-    async def _get_embedding(self, text: str) -> Optional[np.array]:
+    async def _get_embedding(self, text: str) -> Optional[np.ndarray]:
         """Unified embedding getter with metrics and retries"""
         provider = self.valves.embedding_provider_type
         EMBEDDING_REQUESTS.labels(provider).inc()
@@ -6462,8 +6472,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             "name": self._filter_metadata.name,
             "version": self._filter_metadata.version,
             "description": self._filter_metadata.description,
-            "capabilities": [cap.value for cap in self._filter_metadata.capabilities],
-            "operations": [op.value for op in self._filter_metadata.operations],
+            "capabilities": self._filter_metadata.capabilities,
+            "operations": self._filter_metadata.operations,
             "priority": self._filter_metadata.priority.name,
             "dependencies": self._filter_metadata.dependencies,
             "conflicts_with": self._filter_metadata.conflicts_with,
@@ -6525,25 +6535,18 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 return {"conflict_detection_enabled": True, "conflicts": [], "error": "Orchestration manager not available"}
             
             # Simplified orchestration - no registered filters or conflict detector
-            other_filters = []
+            other_filters: List[str] = []
             
             if not self._filter_metadata:
                 return {"conflict_detection_enabled": True, "conflicts": [], "error": "Filter not registered"}
             
-            conflicts = []  # No conflicts in simplified orchestration
+            conflicts: List[Dict[str, Any]] = []  # No conflicts in simplified orchestration
             
             return {
                 "conflict_detection_enabled": True,
                 "filter_count": len(other_filters) + 1,  # +1 for adaptive_memory
                 "conflicts": conflicts,
-                "other_filters": [
-                    {
-                        "name": f.name,
-                        "capabilities": [cap.value for cap in f.capabilities],
-                        "operations": [op.value for op in f.operations]
-                    }
-                    for f in other_filters
-                ]
+                "other_filters": []  # No other filters in simplified orchestration
             }
             
         except Exception as e:
