@@ -929,13 +929,13 @@ class Filter:
         )
         
         llm_model_name: str = Field(
-            default="llama3:latest",
-            description="📝 Model Name: e.g., 'llama3:latest' (Ollama), 'gpt-4' (OpenAI), 'gemini-pro' (Google)"
+            default="llama3.3:70b",
+            description="📝 Model Name: e.g., 'llama3.3:70b' (Ollama), 'gpt-4o' (OpenAI), 'gemini-2.0-flash-exp' (Google)"
         )
         
         memory_mode: Literal["minimal", "balanced", "comprehensive"] = Field(
             default="balanced", 
-            description="🧠 Memory Mode: 'minimal' = key facts only, 'balanced' = important info, 'comprehensive' = remember everything"
+            description="🧠 Memory Mode: 'minimal' = key facts only (1 memory/response, 50 total), 'balanced' = important info (3 memories/response, 200 total), 'comprehensive' = remember everything (5 memories/response, 500 total)"
         )
         
         # ================================================================
@@ -990,9 +990,9 @@ class Filter:
         # 🏛️ MEMORY ORGANIZATION
         # ================================================================
         
-        allowed_memory_banks: List[str] = Field(
-            default=["Personal", "Work", "Hobbies", "Technical"],
-            description="🗂️ Memory Categories: Organize memories into these categories"
+        allowed_memory_banks: Optional[List[str]] = Field(
+            default=None,
+            description="🗂️ Memory Categories: Organize memories into these categories (optional - leave empty to disable categorization)"
         )
         
         default_memory_bank: str = Field(
@@ -1016,18 +1016,18 @@ class Filter:
         # Stream Processing (v0.5.17+)
         enable_stream_filtering: bool = Field(
             default=True,
-            description="🔄 Enable real-time stream filtering for OpenWebUI v0.5.17+"
+            description="🔄 Stream Filtering: Enable real-time filtering of AI responses as they stream to the user (OpenWebUI v0.5.17+). This allows content moderation and PII filtering during response generation."
         )
         
         enable_stream_content_filtering: bool = Field(
             default=False,
-            description="🚫 Filter sensitive content from streaming responses"
+            description="🚫 Stream Content Filtering: When enabled, actively filters out sensitive content (PII, profanity, etc.) from AI responses as they stream. Works in conjunction with Stream Filtering above."
         )
         
         # Database Write Hooks (Issue #11888)
         enable_database_write_hooks: bool = Field(
             default=False,
-            description="💾 Enable database write filtering hooks (OpenWebUI 2024)"
+            description="💾 Database Write Hooks: Enable preprocessing of content before it's saved to the database. This allows separate handling of what users see vs. what gets stored (e.g., encrypt sensitive data before storage)."
         )
         
         enable_pii_filtering: bool = Field(
@@ -1048,12 +1048,12 @@ class Filter:
         # Enhanced Event Emitter Configuration
         enable_enhanced_event_emitter: bool = Field(
             default=True,
-            description="📡 Enable enhanced event emitter patterns (OpenWebUI 2024)"
+            description="📡 Enhanced Event Emitter: Enable advanced event emission patterns with metadata support and batching capabilities. This improves performance for status updates and memory processing notifications."
         )
         
         event_emitter_batch_size: int = Field(
             default=10,
-            description="📦 Batch size for event emissions (0 = no batching)"
+            description="📦 Event Emitter Batch Size: Number of events to batch together before sending to improve performance. Set to 0 to disable batching and send events immediately. Higher values reduce overhead but increase latency."
         )
         
         event_emitter_timeout_ms: int = Field(
@@ -1241,10 +1241,12 @@ Analyze the following related memories and provide a concise summary.""",
         
         @field_validator('allowed_memory_banks')
         def validate_memory_banks(cls, v):
+            if v is None:
+                return None  # Allow None for no categorization
             if not isinstance(v, list) or not v:
-                return ["Personal", "Work", "Hobbies", "Technical"]
+                return None  # Return None instead of default list
             valid_banks = [bank.strip() for bank in v if bank and isinstance(bank, str) and bank.strip()]
-            return valid_banks if valid_banks else ["Personal", "Work", "Hobbies", "Technical"]
+            return valid_banks if valid_banks else None
         
         @field_validator('default_memory_bank')
         def validate_default_memory_bank(cls, v):
@@ -1295,15 +1297,19 @@ Analyze the following related memories and provide a concise summary.""",
             # Auto-configure user-visible settings based on memory_mode if in simple setup
             if self.setup_mode == "simple":
                 if self.memory_mode == "minimal":
-                    object.__setattr__(self, 'memories_to_inject', 1)
-                    object.__setattr__(self, 'max_memories_to_remember', 50)
-                    object.__setattr__(self, 'memory_sensitivity', "low")
-                    object.__setattr__(self, 'relevance_threshold', 0.8)
+                    # Update visible user settings for minimal mode
+                    self.memories_to_inject = 1
+                    self.max_memories_to_remember = 50
+                    self.memory_sensitivity = "low"
+                    self.relevance_threshold = 0.8
+                    self.similarity_threshold = 0.95  # Very high to avoid duplicates
                 elif self.memory_mode == "comprehensive":
-                    object.__setattr__(self, 'memories_to_inject', 5)
-                    object.__setattr__(self, 'max_memories_to_remember', 500)
-                    object.__setattr__(self, 'memory_sensitivity', "high")
-                    object.__setattr__(self, 'relevance_threshold', 0.4)
+                    # Update visible user settings for comprehensive mode
+                    self.memories_to_inject = 5
+                    self.max_memories_to_remember = 500
+                    self.memory_sensitivity = "high"
+                    self.relevance_threshold = 0.4
+                    self.similarity_threshold = 0.75  # Lower to capture more variations
                 # balanced mode uses defaults
             
             return self
@@ -1317,8 +1323,10 @@ Analyze the following related memories and provide a concise summary.""",
         
         @model_validator(mode="after")
         def check_memory_bank_consistency(self):
-            if self.default_memory_bank not in self.allowed_memory_banks:
+            if self.allowed_memory_banks and self.default_memory_bank not in self.allowed_memory_banks:
                 object.__setattr__(self, 'default_memory_bank', self.allowed_memory_banks[0])
+            elif not self.allowed_memory_banks:
+                object.__setattr__(self, 'default_memory_bank', "General")  # Default when no categories
             return self
 
 
@@ -1336,7 +1344,7 @@ Analyze the following related memories and provide a concise summary.""",
     def _validate_configuration_integrity(self, valves_instance) -> bool:
         try:
             return all([
-                isinstance(valves_instance.allowed_memory_banks, list) and valves_instance.allowed_memory_banks,
+                (valves_instance.allowed_memory_banks is None or (isinstance(valves_instance.allowed_memory_banks, list) and valves_instance.allowed_memory_banks)),
                 isinstance(valves_instance.default_memory_bank, str) and valves_instance.default_memory_bank.strip(),
                 0.0 <= valves_instance.vector_similarity_threshold <= 1.0,
                 0.0 <= valves_instance.relevance_threshold <= 1.0,
@@ -2618,8 +2626,11 @@ Analyze the following related memories and provide a concise summary.""",
                 try:
                     allowed_banks = self.valves.allowed_memory_banks
                     default_bank = self.valves.default_memory_bank
-                    bank_list_str = "\n".join([f"- {bank} {'(Default)' if bank == default_bank else ''}" for bank in allowed_banks])
-                    response_msg = f"**Available Memory Banks:**\n{bank_list_str}"
+                    if allowed_banks:
+                        bank_list_str = "\n".join([f"- {bank} {'(Default)' if bank == default_bank else ''}" for bank in allowed_banks])
+                        response_msg = f"**Available Memory Banks:**\n{bank_list_str}"
+                    else:
+                        response_msg = "**Memory banks are disabled.** All memories are stored without categorization."
                     # Use enhanced event emitter for 2024 compliance
                     await self._emit_enhanced_event(
                         __event_emitter__, 
@@ -2648,7 +2659,9 @@ Analyze the following related memories and provide a concise summary.""",
                     memory_id = command_parts[2]
                     target_bank = command_parts[3]
 
-                    if target_bank not in self.valves.allowed_memory_banks:
+                    if not self.valves.allowed_memory_banks:
+                        await self._safe_emit(__event_emitter__, {"type": "error", "content": "Memory banks are disabled. Cannot assign memories to banks."})
+                    elif target_bank not in self.valves.allowed_memory_banks:
                         allowed_banks_str = ", ".join(self.valves.allowed_memory_banks)
                         await self._safe_emit(__event_emitter__, {"type": "error", "content": f"Invalid bank '{target_bank}'. Allowed banks: {allowed_banks_str}"})
                     else:
@@ -2950,6 +2963,17 @@ Analyze the following related memories and provide a concise summary.""",
                     {"type": "error", "content": "Error retrieving relevant memories."},
                 )
 
+        # Clean the body before returning - remove user object if present
+        # OpenWebUI expects 'user' to be a string (user ID) not an object when sending to LLM
+        if 'user' in body and isinstance(body.get('user'), dict):
+            # Extract user ID from user object
+            user_id = body['user'].get('id')
+            if user_id:
+                body['user'] = str(user_id)
+            else:
+                # Remove user field if no ID
+                body.pop('user', None)
+
         return body
 
     async def async_outlet(
@@ -3063,60 +3087,135 @@ Analyze the following related memories and provide a concise summary.""",
         user_timezone = user_valves.timezone or self.valves.timezone
 
         # --- BEGIN MEMORY PROCESSING IN OUTLET --- 
-        # Process the *last user message* for memory extraction *after* the LLM response
+        # Process BOTH the last user message AND the assistant's response for memory extraction
         last_user_message_content = None
+        assistant_response_content = None
         message_history_for_context = []
+        conversation_to_process = ""
+        
         try:
             messages_copy = self._copy_messages(body_copy.get("messages", []))
             if messages_copy:
-                 # Find the actual last user message in the history included in the body
-                 for msg in reversed(messages_copy):
-                     if msg.get("role") == "user" and msg.get("content"):
-                         last_user_message_content = msg.get("content")
-                         break
-                 # Get up to N messages *before* the last user message for context
-                 if last_user_message_content:
-                     user_msg_index = -1
-                     for i, msg in enumerate(messages_copy):
-                         if msg.get("role") == "user" and msg.get("content") == last_user_message_content:
-                             user_msg_index = i
-                             break
-                     if user_msg_index != -1:
-                         start_index = max(0, user_msg_index - self.internal_config.recent_messages_n)
-                         message_history_for_context = messages_copy[start_index:user_msg_index]
+                # Find the last user message and the assistant's response
+                last_user_index = -1
+                
+                # Find the last user message
+                for i in range(len(messages_copy) - 1, -1, -1):
+                    msg = messages_copy[i]
+                    if msg.get("role") == "user" and msg.get("content"):
+                        last_user_message_content = msg.get("content")
+                        last_user_index = i
+                        break
+                
+                # Find the assistant's response that follows the user message
+                if last_user_index != -1 and last_user_index < len(messages_copy) - 1:
+                    # Look for assistant messages after the user message
+                    for i in range(last_user_index + 1, len(messages_copy)):
+                        msg = messages_copy[i]
+                        if msg.get("role") == "assistant" and msg.get("content"):
+                            assistant_response_content = msg.get("content")
+                            break
+                
+                # Get context messages before the last user message
+                if last_user_index != -1:
+                    start_index = max(0, last_user_index - self.internal_config.recent_messages_n)
+                    message_history_for_context = messages_copy[start_index:last_user_index]
+                
+                # Prepare the full conversation for memory extraction
+                if last_user_message_content:
+                    conversation_to_process = f"User: {last_user_message_content}"
+                    if assistant_response_content:
+                        conversation_to_process += f"\n\nAssistant: {assistant_response_content}"
 
-            if last_user_message_content:
-                 logger.info(f"Starting memory processing in outlet for user message: {last_user_message_content[:60]}...")
-                 
-                 # Orchestration error handling wrapper
-                 try:
-                     # Use asyncio.create_task for non-blocking processing
-                     # Reload valves inside _process_user_memories ensures latest config
-                     memory_task = asyncio.create_task(
-                         self._process_user_memories(
-                             user_message=last_user_message_content,
-                             user_id=user_id,
-                             event_emitter=__event_emitter__,
-                             show_status=user_valves.show_status, # Still show status if user wants
-                             user_timezone=user_timezone,
-                             recent_chat_history=message_history_for_context,
-                         )
-                     )
-                     # Optional: Add callback or handle task completion if needed, but allow it to run in background
-                     # memory_task.add_done_callback(lambda t: logger.info(f"Outlet memory task finished: {t.result()}"))
-                 except Exception as memory_error:
-                     # Handle memory processing failures with orchestration system
-                     if self.internal_config.enable_filter_orchestration and hasattr(self, 'orchestration_context'):
-                         self._record_operation_failure("memory_processing", operation_start_time, str(memory_error), getattr(self, 'orchestration_context', None))
-                         
-                         if self.internal_config.enable_rollback_mechanism:
-                             logger.warning(f"Memory processing failed, attempting rollback: {memory_error}")
-                             self._perform_rollback()
-                     
-                     logger.error(f"Memory processing failed: {memory_error}")
-                     raise  # Re-raise to be caught by outer exception handler
+            if conversation_to_process:
+                logger.info(f"Starting memory processing in outlet for conversation")
+                logger.debug(f"Processing user message: {last_user_message_content[:60] if last_user_message_content else 'None'}...")
+                logger.debug(f"Processing assistant response: {assistant_response_content[:60] if assistant_response_content else 'None'}...")
+                
+                # Show status message if enabled
+                if user_valves.show_status and __event_emitter__:
+                    await self._safe_emit(
+                        __event_emitter__,
+                        {
+                            "type": "status",
+                            "data": {
+                                "description": "🧠 Analyzing conversation for memories...",
+                                "done": False,
+                            },
+                        },
+                    )
+                
+                # Orchestration error handling wrapper
+                try:
+                    # Use asyncio.create_task for non-blocking processing
+                    # Process the full conversation (user message + assistant response)
+                    memory_task = asyncio.create_task(
+                        self._process_user_memories(
+                            user_message=conversation_to_process,
+                            user_id=user_id,
+                            event_emitter=__event_emitter__,
+                            show_status=user_valves.show_status,
+                            user_timezone=user_timezone,
+                            recent_chat_history=message_history_for_context,
+                        )
+                    )
+                    
+                    # Wait for the task to complete with a reasonable timeout
+                    try:
+                        await asyncio.wait_for(memory_task, timeout=30.0)
+                        logger.info(f"Memory processing completed successfully")
+                        
+                        # Show completion status
+                        if user_valves.show_status and __event_emitter__:
+                            await self._safe_emit(
+                                __event_emitter__,
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "description": "✅ Memory extraction complete",
+                                        "done": True,
+                                    },
+                                },
+                            )
+                    except asyncio.TimeoutError:
+                        logger.warning("Memory processing timed out after 30 seconds")
+                        if user_valves.show_status and __event_emitter__:
+                            await self._safe_emit(
+                                __event_emitter__,
+                                {
+                                    "type": "status",
+                                    "data": {
+                                        "description": "⚠️ Memory extraction timed out",
+                                        "done": True,
+                                    },
+                                },
+                            )
+                    
+                except Exception as memory_error:
+                    # Handle memory processing failures with orchestration system
+                    if self.internal_config.enable_filter_orchestration and hasattr(self, 'orchestration_context'):
+                        self._record_operation_failure("memory_processing", operation_start_time, str(memory_error), getattr(self, 'orchestration_context', None))
+                        
+                        if self.internal_config.enable_rollback_mechanism:
+                            logger.warning(f"Memory processing failed, attempting rollback: {memory_error}")
+                            self._perform_rollback()
+                    
+                    logger.error(f"Memory processing failed: {memory_error}")
+                    
+                    if user_valves.show_status and __event_emitter__:
+                        await self._safe_emit(
+                            __event_emitter__,
+                            {
+                                "type": "status",
+                                "data": {
+                                    "description": f"❌ Memory extraction failed: {str(memory_error)[:50]}",
+                                    "done": True,
+                                },
+                            },
+                        )
+                    raise  # Re-raise to be caught by outer exception handler
             else:
-                 logger.warning("Could not find last user message in outlet body to process for memories.")
+                logger.warning("No conversation content found in outlet body to process for memories.")
 
         except Exception as e:
             logger.error(f"Error initiating memory processing in outlet: {e}\n{traceback.format_exc()}")
@@ -3153,6 +3252,17 @@ Analyze the following related memories and provide a concise summary.""",
             except Exception as e:
                 logger.debug(f"Failed to record orchestration completion: {e}")
 
+        # Clean the body before returning - remove user object if present
+        # OpenWebUI expects 'user' to be a string (user ID) not an object when sending to LLM
+        if 'user' in body_copy and isinstance(body_copy.get('user'), dict):
+            # Extract user ID from user object
+            user_id = body_copy['user'].get('id')
+            if user_id:
+                body_copy['user'] = str(user_id)
+            else:
+                # Remove user field if no ID
+                body_copy.pop('user', None)
+        
         # Return the modified response
         return body_copy
 
@@ -4076,7 +4186,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
 
             # --- SIMPLIFIED VALIDATION LOGIC ---
             # Use the validated list directly from self.valves
-            allowed_banks_list = self.valves.allowed_memory_banks
+            allowed_banks_list = self.valves.allowed_memory_banks or []
 
             if provided_bank in allowed_banks_list:
                  # Valid bank provided
@@ -6249,7 +6359,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         memory_bank = item.get("memory_bank", self.valves.default_memory_bank)
                         
                         # Validate memory_bank
-                        if memory_bank not in self.valves.allowed_memory_banks:
+                        if self.valves.allowed_memory_banks and memory_bank not in self.valves.allowed_memory_banks:
                             memory_bank = self.valves.default_memory_bank
 
                         # Basic validation
@@ -6895,11 +7005,24 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 return normalized_body
             
             # Improved event loop management for OpenWebUI 2024
-            return self._run_async_in_sync_context(
+            result = self._run_async_in_sync_context(
                 self.async_inlet(normalized_body, __event_emitter__, user_info),
                 "inlet",
                 normalized_body
             )
+            
+            # Clean the result before returning - remove user object if present
+            # OpenWebUI expects 'user' to be a string (user ID) not an object when sending to LLM
+            if 'user' in result and isinstance(result.get('user'), dict):
+                # Extract user ID from user object  
+                user_id = result['user'].get('id')
+                if user_id:
+                    result['user'] = str(user_id)
+                else:
+                    # Remove user field if no ID
+                    result.pop('user', None)
+            
+            return result
                     
         except Exception as e:
             logger.error(f"Error in sync inlet: {e}\n{traceback.format_exc()}")
@@ -6930,11 +7053,24 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 return normalized_body
             
             # Improved event loop management for OpenWebUI 2024
-            return self._run_async_in_sync_context(
+            result = self._run_async_in_sync_context(
                 self.async_outlet(normalized_body, __event_emitter__, user_info),
                 "outlet",
                 normalized_body
             )
+            
+            # Clean the result before returning - remove user object if present
+            # OpenWebUI expects 'user' to be a string (user ID) not an object when sending to LLM
+            if 'user' in result and isinstance(result.get('user'), dict):
+                # Extract user ID from user object
+                user_id = result['user'].get('id')
+                if user_id:
+                    result['user'] = str(user_id)
+                else:
+                    # Remove user field if no ID
+                    result.pop('user', None)
+            
+            return result
                     
         except Exception as e:
             logger.error(f"Error in sync outlet: {e}\n{traceback.format_exc()}")
