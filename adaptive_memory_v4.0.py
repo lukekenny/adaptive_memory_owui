@@ -91,6 +91,295 @@ logger.propagate = False # Prevent duplicate logs if root logger has handlers
 # Do not override root logger level; respect GLOBAL_LOG_LEVEL or root config
 
 
+# ============================================================================
+# Custom Exception Framework for Adaptive Memory Plugin
+# ============================================================================
+
+class AdaptiveMemoryError(Exception):
+    """Base exception for all adaptive memory plugin errors"""
+    error_code: str = "AM_GENERIC_ERROR"
+    
+    def __init__(self, message: str, details: Optional[Dict[str, Any]] = None, suggestion: Optional[str] = None):
+        self.message = message
+        self.details = details or {}
+        self.suggestion = suggestion
+        super().__init__(self.format_message())
+    
+    def format_message(self) -> str:
+        """Format exception message with details and suggestions"""
+        msg = f"[{self.error_code}] {self.message}"
+        if self.details:
+            msg += f"\nDetails: {json.dumps(self.details, indent=2)}"
+        if self.suggestion:
+            msg += f"\nSuggestion: {self.suggestion}"
+        return msg
+    
+    def to_log_dict(self) -> Dict[str, Any]:
+        """Convert exception to dictionary for structured logging"""
+        return {
+            "error_code": self.error_code,
+            "message": self.message,
+            "details": self.details,
+            "suggestion": self.suggestion,
+            "exception_type": self.__class__.__name__
+        }
+
+
+# LLM Connection Errors
+class LLMConnectionError(AdaptiveMemoryError):
+    """Base exception for LLM connection issues"""
+    error_code = "AM_LLM_CONNECTION_ERROR"
+
+class LLMTimeoutError(LLMConnectionError):
+    """LLM request timed out"""
+    error_code = "AM_LLM_TIMEOUT"
+    
+    def __init__(self, provider: str, timeout_seconds: float, endpoint: Optional[str] = None):
+        super().__init__(
+            f"LLM request to {provider} timed out after {timeout_seconds}s",
+            details={"provider": provider, "timeout": timeout_seconds, "endpoint": endpoint},
+            suggestion="Increase timeout value in configuration or check LLM service availability"
+        )
+
+class LLMAuthenticationError(LLMConnectionError):
+    """LLM authentication failed"""
+    error_code = "AM_LLM_AUTH_FAILED"
+    
+    def __init__(self, provider: str, status_code: Optional[int] = None):
+        super().__init__(
+            f"Authentication failed for {provider}",
+            details={"provider": provider, "status_code": status_code},
+            suggestion="Check API key configuration and ensure it's valid for the provider"
+        )
+
+class LLMServiceUnavailableError(LLMConnectionError):
+    """LLM service is unavailable"""
+    error_code = "AM_LLM_SERVICE_UNAVAILABLE"
+    
+    def __init__(self, provider: str, status_code: Optional[int] = None, retry_after: Optional[int] = None):
+        super().__init__(
+            f"{provider} service is currently unavailable",
+            details={"provider": provider, "status_code": status_code, "retry_after": retry_after},
+            suggestion=f"Wait {retry_after or 60} seconds before retrying or check service status"
+        )
+
+
+# API Format Errors
+class APIFormatError(AdaptiveMemoryError):
+    """Base exception for API format mismatches"""
+    error_code = "AM_API_FORMAT_ERROR"
+
+class GeminiAPIFormatError(APIFormatError):
+    """Gemini API specific format error"""
+    error_code = "AM_GEMINI_FORMAT_ERROR"
+    
+    def __init__(self, expected_format: str, received_format: str, field: Optional[str] = None):
+        super().__init__(
+            "Gemini API format mismatch",
+            details={"expected": expected_format, "received": received_format, "field": field},
+            suggestion="Ensure using Gemini-specific request format (not OpenAI format)"
+        )
+
+class UnsupportedProviderError(APIFormatError):
+    """Unsupported LLM provider"""
+    error_code = "AM_UNSUPPORTED_PROVIDER"
+    
+    def __init__(self, provider: str, supported_providers: List[str]):
+        super().__init__(
+            f"Provider '{provider}' is not supported",
+            details={"provider": provider, "supported": supported_providers},
+            suggestion=f"Use one of the supported providers: {', '.join(supported_providers)}"
+        )
+
+
+# JSON Parsing Errors
+class JSONParsingError(AdaptiveMemoryError):
+    """Base exception for JSON parsing issues"""
+    error_code = "AM_JSON_PARSE_ERROR"
+
+class MalformedJSONError(JSONParsingError):
+    """JSON response is malformed"""
+    error_code = "AM_MALFORMED_JSON"
+    
+    def __init__(self, raw_response: str, parse_error: str):
+        truncated = raw_response[:200] + "..." if len(raw_response) > 200 else raw_response
+        super().__init__(
+            "Failed to parse JSON response",
+            details={"response_preview": truncated, "parse_error": parse_error},
+            suggestion="Enable JSON repair system or use a model with better JSON formatting"
+        )
+
+class JSONSchemaViolationError(JSONParsingError):
+    """JSON doesn't match expected schema"""
+    error_code = "AM_JSON_SCHEMA_VIOLATION"
+    
+    def __init__(self, expected_fields: List[str], received_fields: List[str]):
+        missing = set(expected_fields) - set(received_fields)
+        extra = set(received_fields) - set(expected_fields)
+        super().__init__(
+            "JSON response doesn't match expected schema",
+            details={"missing_fields": list(missing), "extra_fields": list(extra)},
+            suggestion="Check LLM prompt to ensure it generates required fields"
+        )
+
+
+# Memory Operation Errors
+class MemoryOperationError(AdaptiveMemoryError):
+    """Base exception for memory operation failures"""
+    error_code = "AM_MEMORY_OP_ERROR"
+
+class MemoryReadError(MemoryOperationError):
+    """Failed to read memory"""
+    error_code = "AM_MEMORY_READ_ERROR"
+    
+    def __init__(self, user_id: str, memory_id: Optional[str] = None, reason: Optional[str] = None):
+        super().__init__(
+            f"Failed to read memory for user {user_id}",
+            details={"user_id": user_id, "memory_id": memory_id, "reason": reason},
+            suggestion="Check database connection and user permissions"
+        )
+
+class MemoryWriteError(MemoryOperationError):
+    """Failed to write memory"""
+    error_code = "AM_MEMORY_WRITE_ERROR"
+    
+    def __init__(self, user_id: str, operation: str, reason: Optional[str] = None):
+        super().__init__(
+            f"Failed to {operation} memory for user {user_id}",
+            details={"user_id": user_id, "operation": operation, "reason": reason},
+            suggestion="Check database write permissions and storage availability"
+        )
+
+class MemoryCorruptionError(MemoryOperationError):
+    """Memory data is corrupted"""
+    error_code = "AM_MEMORY_CORRUPTION"
+    
+    def __init__(self, memory_id: str, corruption_type: str):
+        super().__init__(
+            f"Memory {memory_id} is corrupted",
+            details={"memory_id": memory_id, "corruption_type": corruption_type},
+            suggestion="Consider restoring from backup or clearing corrupted memory"
+        )
+
+
+# User Isolation Errors
+class UserIsolationError(AdaptiveMemoryError):
+    """Base exception for user isolation issues"""
+    error_code = "AM_USER_ISOLATION_ERROR"
+
+class UserContextMissingError(UserIsolationError):
+    """User context is missing"""
+    error_code = "AM_USER_CONTEXT_MISSING"
+    
+    def __init__(self, required_field: str):
+        super().__init__(
+            "Required user context is missing",
+            details={"required_field": required_field},
+            suggestion="Ensure OpenWebUI is passing complete user information"
+        )
+
+class UserPermissionError(UserIsolationError):
+    """User permission violation"""
+    error_code = "AM_USER_PERMISSION_ERROR"
+    
+    def __init__(self, user_id: str, attempted_action: str, target_resource: Optional[str] = None):
+        super().__init__(
+            f"User {user_id} lacks permission for {attempted_action}",
+            details={"user_id": user_id, "action": attempted_action, "resource": target_resource},
+            suggestion="Check user permissions and ensure proper access control"
+        )
+
+class CrossUserLeakageError(UserIsolationError):
+    """Potential cross-user data leakage detected"""
+    error_code = "AM_CROSS_USER_LEAKAGE"
+    
+    def __init__(self, requesting_user: str, leaked_user: str, context: str):
+        super().__init__(
+            "CRITICAL: Potential cross-user data leakage detected",
+            details={"requesting_user": requesting_user, "leaked_user": leaked_user, "context": context},
+            suggestion="Immediately review user isolation logic and database queries"
+        )
+
+
+# Filter Orchestration Errors
+class FilterOrchestrationError(AdaptiveMemoryError):
+    """Base exception for filter orchestration issues"""
+    error_code = "AM_ORCHESTRATION_ERROR"
+
+class FilterPipelineError(FilterOrchestrationError):
+    """Filter pipeline execution failed"""
+    error_code = "AM_PIPELINE_ERROR"
+    
+    def __init__(self, stage: str, filter_name: str, reason: str):
+        super().__init__(
+            f"Filter pipeline failed at {stage} stage",
+            details={"stage": stage, "filter": filter_name, "reason": reason},
+            suggestion="Check filter configuration and ensure all filters are compatible"
+        )
+
+class FilterCompatibilityError(FilterOrchestrationError):
+    """Filter compatibility issue"""
+    error_code = "AM_FILTER_COMPATIBILITY"
+    
+    def __init__(self, filter1: str, filter2: str, incompatibility: str):
+        super().__init__(
+            f"Filters {filter1} and {filter2} are incompatible",
+            details={"filter1": filter1, "filter2": filter2, "issue": incompatibility},
+            suggestion="Review filter priorities and data transformation requirements"
+        )
+
+
+# Circuit Breaker Errors
+class CircuitBreakerError(AdaptiveMemoryError):
+    """Circuit breaker is open"""
+    error_code = "AM_CIRCUIT_BREAKER_OPEN"
+    
+    def __init__(self, service: str, failure_count: int, reset_time: Optional[float] = None):
+        super().__init__(
+            f"Circuit breaker open for {service} after {failure_count} failures",
+            details={"service": service, "failures": failure_count, "reset_time": reset_time},
+            suggestion=f"Service will be retried in {reset_time or 60} seconds"
+        )
+
+
+# Embedding Errors
+class EmbeddingError(AdaptiveMemoryError):
+    """Base exception for embedding-related errors"""
+    error_code = "AM_EMBEDDING_ERROR"
+
+class EmbeddingModelLoadError(EmbeddingError):
+    """Failed to load embedding model"""
+    error_code = "AM_EMBEDDING_MODEL_LOAD_ERROR"
+    
+    def __init__(self, model_name: str, reason: str):
+        super().__init__(
+            f"Failed to load embedding model {model_name}",
+            details={"model": model_name, "reason": reason},
+            suggestion="Check if model is installed and system has sufficient memory"
+        )
+
+class EmbeddingGenerationError(EmbeddingError):
+    """Failed to generate embeddings"""
+    error_code = "AM_EMBEDDING_GENERATION_ERROR"
+    
+    def __init__(self, text_length: int, reason: str):
+        super().__init__(
+            "Failed to generate embeddings",
+            details={"text_length": text_length, "reason": reason},
+            suggestion="Check text encoding and model input limits"
+        )
+
+
+# Utility function to log exceptions consistently
+def log_exception(logger_instance: logging.Logger, exception: AdaptiveMemoryError, level: str = "error"):
+    """Log an AdaptiveMemoryError with structured format"""
+    log_method = getattr(logger_instance, level, logger_instance.error)
+    # Use a custom field name to avoid conflict with logging's 'message' field
+    extra_dict = exception.to_log_dict()
+    extra_dict["exception_message"] = extra_dict.pop("message")
+    log_method(f"AdaptiveMemory Exception: {exception.message}", extra=extra_dict)
+
+
 class MemoryOperation(BaseModel):
     """Model for memory operations"""
 
@@ -115,8 +404,19 @@ class Filter:
                 # Use the model name from valves for local loading too
                 local_model_name = self.valves.embedding_model_name if self.valves.embedding_provider_type == 'local' else 'all-MiniLM-L6-v2'
                 self._embedding_model = SentenceTransformer(local_model_name)
+            except ImportError as e:
+                error = EmbeddingModelLoadError(
+                    model_name=local_model_name, 
+                    reason=f"SentenceTransformer library not available: {str(e)}"
+                )
+                log_exception(logger, error)
+                self._embedding_model = None
             except Exception as e:
-                logger.error(f"Failed to load local SentenceTransformer model: {e}")
+                error = EmbeddingModelLoadError(
+                    model_name=local_model_name,
+                    reason=str(e)
+                )
+                log_exception(logger, error)
                 self._embedding_model = None
         return self._embedding_model
     
@@ -139,21 +439,44 @@ class Filter:
                     from sentence_transformers import SentenceTransformer
                     local_model_name = self.valves.embedding_model_name if self.valves.embedding_provider_type == 'local' else 'all-MiniLM-L6-v2'
                     return SentenceTransformer(local_model_name)
+                except ImportError as e:
+                    error = EmbeddingModelLoadError(
+                        model_name=local_model_name,
+                        reason=f"SentenceTransformer library not available: {str(e)}"
+                    )
+                    log_exception(logger, error)
+                    return None
                 except Exception as e:
-                    logger.error(f"Failed to load local SentenceTransformer model: {e}")
+                    error = EmbeddingModelLoadError(
+                        model_name=local_model_name,
+                        reason=str(e)
+                    )
+                    log_exception(logger, error)
                     return None
             model = await asyncio.wait_for(asyncio.to_thread(_load_model), timeout=timeout_seconds)
             if model is not None:
                 self._embedding_model = model
                 return True
-            logger.error("Failed to load embedding model")
+            error = EmbeddingModelLoadError(
+                model_name=self.valves.embedding_model_name,
+                reason="Model initialization returned None"
+            )
+            log_exception(logger, error)
             return False
                 
         except asyncio.TimeoutError:
-            logger.error(f"Embedding model loading timed out after {timeout_seconds} seconds")
+            error = EmbeddingModelLoadError(
+                model_name=self.valves.embedding_model_name,
+                reason=f"Model loading timed out after {timeout_seconds} seconds"
+            )
+            log_exception(logger, error)
             return False
         except Exception as e:
-            logger.error(f"Error during safe embedding model initialization: {e}")
+            error = EmbeddingModelLoadError(
+                model_name=self.valves.embedding_model_name,
+                reason=f"Unexpected error during initialization: {str(e)}"
+            )
+            log_exception(logger, error)
             return False
 
     @property
@@ -1100,7 +1423,12 @@ Analyze the following related memories and provide a concise summary.""",
         state["last_failure"] = time.time()
         if state["failures"] >= self.valves.circuit_breaker_failure_threshold:
             state["is_open"] = True
-            logger.warning(f"Circuit breaker opened for {key} after {state['failures']} failures")
+            error = CircuitBreakerError(
+                service=key,
+                failure_count=state['failures'],
+                reset_time=self.valves.circuit_breaker_timeout
+            )
+            log_exception(logger, error, level="warning")
         self._circuit_breaker_state[key] = state
     
     def _record_circuit_breaker_success(self, api_url: str, provider_type: str) -> None:
@@ -1195,7 +1523,12 @@ Analyze the following related memories and provide a concise summary.""",
         if self.memory_processing_failures >= failure_count:
             self.memory_processing_circuit_open = True
             self.memory_processing_circuit_reset_time = time.time() + reset_time
-            logger.warning(f"Memory processing circuit breaker opened after {self.memory_processing_failures} failures")
+            error = CircuitBreakerError(
+                service="memory_processing",
+                failure_count=self.memory_processing_failures,
+                reset_time=reset_time
+            )
+            log_exception(logger, error, level="warning")
     
     def _record_memory_processing_success(self) -> None:
         """Record successful memory processing"""
@@ -1399,7 +1732,8 @@ Analyze the following related memories and provide a concise summary.""",
 
         # Ensure user info is present
         if not __user__ or not __user__.get("id"):
-            logger.warning("Inlet: User info or ID missing, skipping processing.")
+            error = UserContextMissingError(required_field="user.id")
+            log_exception(logger, error, level="warning")
             return body
         user_id = __user__["id"]
         logger.info(f"Processing inlet for user_id: {user_id}")
@@ -3056,7 +3390,8 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                 return []
             return parsed
         except json.JSONDecodeError as e:
-            logger.warning(f"Direct JSON parsing failed: {e}")
+            # Don't raise exception here, try fallback methods first
+            logger.debug(f"Direct JSON parsing failed, trying fallback methods: {e}")
 
         # Try extracting from code blocks
         code_block_pattern = r"```(?:json)?\s*(\[[\s\S]*?\]|\{[\s\S]*?\})\s*```"
@@ -3081,9 +3416,14 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
         self.error_counters["json_parse_errors"] += 1
         self.error_timestamps["json_parse_errors"].append(time.time())
         self._error_message = "json_parse_error"
-        logger.error(f"Failed to extract valid JSON from LLM response after all attempts")
-        logger.debug(f"Full text that failed JSON parsing: {text}")
-        return None
+        
+        # Raise custom exception
+        error = MalformedJSONError(
+            raw_response=text[:500],  # Truncate for error message
+            parse_error="Failed to parse JSON after trying direct parsing, code block extraction, and JSON repair"
+        )
+        log_exception(logger, error)
+        raise error
 
     def _calculate_memory_similarity(self, memory1: str, memory2: str) -> float:
         if not memory1 or not memory2:
@@ -4577,7 +4917,21 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         # Handle error response
                         error_text = await response.text()
                         error_msg = f"API ({provider_type}) returned {response.status}: {error_text}"
-                        logger.warning(f"API error: {error_msg}")
+                        
+                        # Log specific exceptions based on status code
+                        if response.status == 401:
+                            error = LLMAuthenticationError(provider=provider_type, status_code=response.status)
+                            log_exception(logger, error)
+                        elif response.status == 503:
+                            retry_after = response.headers.get('Retry-After')
+                            error = LLMServiceUnavailableError(
+                                provider=provider_type, 
+                                status_code=response.status,
+                                retry_after=int(retry_after) if retry_after and retry_after.isdigit() else None
+                            )
+                            log_exception(logger, error)
+                        else:
+                            logger.warning(f"API error: {error_msg}")
                         
                         # Record failure for circuit breaker
                         self._record_circuit_breaker_failure(api_url, provider_type)
@@ -4602,7 +4956,12 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                             return False, error_msg
                             
             except asyncio.TimeoutError:
-                logger.warning(f"Attempt {attempt} failed: API request timed out")
+                error = LLMTimeoutError(
+                    provider=provider_type,
+                    timeout_seconds=30.0,  # Default timeout
+                    endpoint=api_url
+                )
+                log_exception(logger, error, level="warning")
                 self._record_circuit_breaker_failure(api_url, provider_type)
                 
                 if attempt <= max_retries:
@@ -4610,11 +4969,11 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     base_delay = retry_delay * (2 ** (attempt - 1))
                     jitter = random.uniform(0.1, 0.8)
                     sleep_time = base_delay + jitter
-                    logger.warning(f"Retrying after timeout in {sleep_time:.2f} seconds...")
+                    logger.info(f"Retrying after timeout in {sleep_time:.2f} seconds...")
                     await asyncio.sleep(sleep_time)
                     continue
                 else:
-                    return False, "API request timed out after multiple retries"
+                    raise error
                     
             except ClientError as e:
                 logger.warning(f"Attempt {attempt} failed: API connection error: {str(e)}")
@@ -4735,7 +5094,10 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             
             return data
         else:
-            raise ValueError(f"Unsupported provider type: {provider_type}")
+            raise UnsupportedProviderError(
+                provider=provider_type,
+                supported_providers=["ollama", "openai_compatible", "gemini"]
+            )
 
     def _build_llm_request_headers(self, provider_type: str, api_key: Optional[str]) -> dict:
         """Build headers for LLM requests."""
