@@ -4,12 +4,16 @@ A monolithic OpenWebUI filter function that provides persistent memory capabilit
 
 ## What's New in v4.0
 
+- **User-Friendly Interface**: Revolutionary valve system redesign with intuitive 4-field Quick Setup
+- **Smart Auto-Configuration**: Automatically configures 90+ settings based on your preferences
 - **36% Code Reduction**: Optimized from 9,156 to 5,853 lines while maintaining all features
+- **Simple vs Advanced Modes**: Choose between "just works" simplicity or full control
+- **Logical Field Grouping**: Organized settings with emojis and clear descriptions
+- **Enhanced Validation**: Helpful error messages guide you to correct configuration
 - **Security Fixes**: Updated dependencies to patch CVE-2024-3772, CVE-2024-23334, CVE-2024-27306
 - **JSON Repair System**: Added support for sub-3B models with improved JSON parsing
 - **Gemini API Fix**: Corrected authentication method for Gemini API integration
 - **Enhanced Error Handling**: Improved circuit breaker pattern for better fault tolerance
-- **Performance Optimizations**: Streamlined memory operations and reduced overhead
 
 ## Installation
 
@@ -58,12 +62,22 @@ The filter will extract and remember these preferences for future conversations.
 
 ## Configuration
 
-The filter includes configurable valves for:
-- LLM provider settings (Ollama, OpenAI, Gemini)
-- Memory extraction thresholds
-- Maximum memories to inject
-- Debug logging options
-- Memory bank categories
+### Quick Setup (Recommended)
+Most users only need to configure these 4 settings:
+
+1. **🎯 Configuration Mode**: Choose "simple" (auto-configure everything) or "advanced" (full control)
+2. **🤖 LLM Provider**: Select your AI service (Ollama, OpenAI-compatible, or Google Gemini)
+3. **📝 Model Name**: Specify your model (e.g., "llama3:latest", "gpt-4", "gemini-pro")
+4. **🧠 Memory Mode**: Choose how much to remember ("minimal", "balanced", or "comprehensive")
+
+### Advanced Configuration
+For power users, the filter includes configurable settings for:
+- API endpoints and authentication
+- Memory sensitivity and thresholds
+- Memory organization and categories
+- Advanced processing options
+- Performance and reliability settings
+- Custom system prompts
 
 ## Requirements
 
