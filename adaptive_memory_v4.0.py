@@ -1,5 +1,4 @@
 import json
-import copy
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Union, Set
@@ -1464,6 +1463,11 @@ Analyze the following related memories and provide a concise summary.""",
         self._memory_embeddings: Dict[str, Any] = {}  # Memory ID to embedding mapping
         self._relevance_cache: Dict[str, Any] = {}  # Relevance score cache
         
+        # Initialize additional performance caches
+        self._similarity_cache: Dict[str, float] = {}  # Similarity calculation cache
+        self._user_embedding_cache: Dict[str, Any] = {}  # User message embedding cache
+        self._llm_response_cache: Dict[str, Any] = {}  # LLM response cache for repeated queries
+        
         # Initialize rollback stack and orchestration variables
         self._rollback_stack: List[Dict[str, Any]] = []
         self._orchestration_context: Optional[Any] = None
@@ -1492,6 +1496,83 @@ Analyze the following related memories and provide a concise summary.""",
         if self.valves.enable_filter_orchestration:
             self._initialize_filter_orchestration()
 
+    def _selective_copy(self, obj: Any, max_depth: int = 3, current_depth: int = 0) -> Any:
+        """Perform selective copying with depth limit to avoid expensive deep copies."""
+        if current_depth >= max_depth:
+            return obj
+        
+        if isinstance(obj, dict):
+            # Only copy essential keys for rollback
+            essential_keys = {'original_body', 'user_id', 'timestamp', 'messages', 'role', 'content'}
+            return {k: self._selective_copy(v, max_depth, current_depth + 1) 
+                   for k, v in obj.items() if k in essential_keys or current_depth == 0}
+        elif isinstance(obj, list):
+            # Limit list copying to avoid memory issues
+            if len(obj) > 100:  # Limit large lists
+                return [self._selective_copy(item, max_depth, current_depth + 1) for item in obj[:100]]
+            return [self._selective_copy(item, max_depth, current_depth + 1) for item in obj]
+        elif isinstance(obj, (str, int, float, bool, type(None))):
+            return obj
+        else:
+            # For other types, return as-is to avoid deep copy overhead
+            return obj
+
+    def _copy_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Efficiently copy messages array with only essential fields."""
+        if not messages:
+            return []
+        
+        copied_messages = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                # Only copy essential message fields
+                copied_msg = {
+                    'role': msg.get('role', 'user'),
+                    'content': msg.get('content', ''),
+                }
+                # Add other essential fields if they exist
+                for key in ['timestamp', 'id', 'metadata']:
+                    if key in msg:
+                        copied_msg[key] = msg[key]
+                copied_messages.append(copied_msg)
+            else:
+                copied_messages.append(msg)
+        return copied_messages
+
+    def _cache_similarity(self, key1: str, key2: str, similarity: float) -> None:
+        """Cache similarity calculation results."""
+        cache_key = f"{key1}:{key2}"
+        self._similarity_cache[cache_key] = similarity
+        
+        # Limit cache size to prevent memory bloat
+        if len(self._similarity_cache) > 1000:
+            # Remove oldest 20% of entries
+            oldest_keys = list(self._similarity_cache.keys())[:200]
+            for key in oldest_keys:
+                del self._similarity_cache[key]
+
+    def _get_cached_similarity(self, key1: str, key2: str) -> Optional[float]:
+        """Get cached similarity if available."""
+        cache_key = f"{key1}:{key2}"
+        return self._similarity_cache.get(cache_key)
+
+    def _cache_user_embedding(self, message: str, embedding: Any) -> None:
+        """Cache user message embedding."""
+        # Use message hash as key to avoid storing full message content
+        msg_hash = str(hash(message))
+        self._user_embedding_cache[msg_hash] = embedding
+        
+        # Limit cache size
+        if len(self._user_embedding_cache) > 500:
+            oldest_keys = list(self._user_embedding_cache.keys())[:100]
+            for key in oldest_keys:
+                del self._user_embedding_cache[key]
+
+    def _get_cached_user_embedding(self, message: str) -> Optional[Any]:
+        """Get cached user message embedding."""
+        msg_hash = str(hash(message))
+        return self._user_embedding_cache.get(msg_hash)
+
     def cleanup_memory_resources(self):
         """Clean up memory resources to prevent memory leaks"""
         try:
@@ -1500,6 +1581,14 @@ Analyze the following related memories and provide a concise summary.""",
                 self._memory_embeddings.clear()
             if hasattr(self, '_relevance_cache'):
                 self._relevance_cache.clear()
+            
+            # Clear performance caches
+            if hasattr(self, '_similarity_cache'):
+                self._similarity_cache.clear()
+            if hasattr(self, '_user_embedding_cache'):
+                self._user_embedding_cache.clear()
+            if hasattr(self, '_llm_response_cache'):
+                self._llm_response_cache.clear()
             
             # Clear rollback stack
             if hasattr(self, '_rollback_stack'):
@@ -1571,7 +1660,7 @@ Analyze the following related memories and provide a concise summary.""",
             self._rollback_stack.append({
                 "operation": operation, 
                 "timestamp": time.time(), 
-                "data": copy.deepcopy(data), 
+                "data": self._selective_copy(data), 
                 "rollback_id": str(uuid.uuid4())
             })
             # Limit rollback stack size to prevent memory leaks
@@ -1681,49 +1770,72 @@ Analyze the following related memories and provide a concise summary.""",
                         logger.warning(f"Failed to generate embedding for memory {mem_id} during clustering: {e}")
                         self.memory_embeddings[mem_id] = None # Mark as failed
             
-            # Simple greedy clustering based on similarity
-            temp_eligible = eligible_memories[:] # Work with a copy
-            while temp_eligible:
-                current_mem = temp_eligible.pop(0)
+            # Optimized clustering using precomputed similarities
+            unprocessed_memories = [mem for mem in eligible_memories 
+                                   if mem.get("id") not in processed_ids and 
+                                   self.memory_embeddings.get(mem.get("id")) is not None]
+            
+            # Use index-based approach for better performance
+            i = 0
+            while i < len(unprocessed_memories):
+                current_mem = unprocessed_memories[i]
                 current_id = current_mem.get("id")
+                
                 if current_id in processed_ids:
+                    i += 1
                     continue
                 
                 current_emb = self.memory_embeddings.get(current_id)
                 if current_emb is None:
                     processed_ids.add(current_id)
-                    continue # Skip if no embedding
+                    i += 1
+                    continue
                     
                 cluster = [current_mem]
                 processed_ids.add(current_id)
                 
-                remaining_after_pop = []
-                for other_mem in temp_eligible:
+                # Find similar memories in remaining list
+                j = i + 1
+                while j < len(unprocessed_memories):
+                    other_mem = unprocessed_memories[j]
                     other_id = other_mem.get("id")
+                    
                     if other_id in processed_ids:
+                        j += 1
                         continue
                         
                     other_emb = self.memory_embeddings.get(other_id)
                     if other_emb is None:
-                         remaining_after_pop.append(other_mem)
-                         continue # Skip if no embedding
+                        j += 1
+                        continue
                          
-                    # Calculate similarity
+                    # Calculate similarity with caching and error handling
                     try:
-                        similarity = float(np.dot(current_emb, other_emb))
+                        # Check cache first
+                        cached_sim = self._get_cached_similarity(current_id, other_id)
+                        if cached_sim is not None:
+                            similarity = cached_sim
+                        else:
+                            similarity = float(np.dot(current_emb, other_emb))
+                            # Cache the result
+                            self._cache_similarity(current_id, other_id, similarity)
+                        
                         if similarity >= threshold:
                             cluster.append(other_mem)
                             processed_ids.add(other_id)
-                        else:
-                           remaining_after_pop.append(other_mem) # Keep for next iteration
+                            # Remove from unprocessed list to avoid reprocessing
+                            unprocessed_memories.pop(j)
+                            continue  # Don't increment j as we removed an element
                     except Exception as e:
-                       logger.warning(f"Error comparing embeddings for {current_id} and {other_id}: {e}")
-                       remaining_after_pop.append(other_mem)
+                        logger.warning(f"Error comparing embeddings for {current_id} and {other_id}: {e}")
+                    
+                    j += 1
                 
-                temp_eligible = remaining_after_pop # Update list for next outer loop iteration
-                
+                # Add cluster if it meets minimum size
                 if len(cluster) >= self.valves.summarization_min_cluster_size:
                     embedding_clusters.append(cluster)
+                
+                i += 1
             # If strategy is only embeddings, return now
             if strategy == "embeddings":
                  return embedding_clusters
@@ -2332,7 +2444,7 @@ Analyze the following related memories and provide a concise summary.""",
                 
                 # Create rollback point
                 self._create_rollback_point("inlet", {
-                    "original_body": copy.deepcopy(body),
+                    "original_body": self._selective_copy(body),
                     "user_id": user_id,
                     "timestamp": time.time()
                 })
@@ -2800,9 +2912,9 @@ Analyze the following related memories and provide a concise summary.""",
 
         # Log function entry
 
-        # DEFENSIVE: Make a deep copy of the body to avoid dictionary changed size during iteration
-        # This was a source of many subtle bugs
-        body_copy = copy.deepcopy(body)
+        # DEFENSIVE: Make a selective copy of the body to avoid dictionary changed size during iteration
+        # Use selective copying for better performance
+        body_copy = self._selective_copy(body, max_depth=2)
 
         # -----------------------------------------------------------
         # Filter Orchestration System Integration for Outlet
@@ -2821,7 +2933,7 @@ Analyze the following related memories and provide a concise summary.""",
                 
                 # Create rollback point
                 self._create_rollback_point("outlet", {
-                    "original_body": copy.deepcopy(body),
+                    "original_body": self._selective_copy(body),
                     "user_id": user_id,
                     "timestamp": time.time()
                 })
@@ -2870,7 +2982,7 @@ Analyze the following related memories and provide a concise summary.""",
         last_user_message_content = None
         message_history_for_context = []
         try:
-            messages_copy = copy.deepcopy(body_copy.get("messages", []))
+            messages_copy = self._copy_messages(body_copy.get("messages", []))
             if messages_copy:
                  # Find the actual last user message in the history included in the body
                  for msg in reversed(messages_copy):
@@ -4501,10 +4613,14 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                     logger.debug(f"Error calculating embedding similarity: {e}")
                     score.embedding_similarity = 0.0
             
-            # 4. Length Similarity
+            # 4. Length Similarity with safe division
             len1, len2 = len(new_content.strip()), len(existing_content.strip())
             if len1 > 0 and len2 > 0:
-                score.length_similarity = 1.0 - abs(len1 - len2) / max(len1, len2)
+                max_len = max(len1, len2)
+                if max_len > 0:
+                    score.length_similarity = 1.0 - abs(len1 - len2) / max_len
+                else:
+                    score.length_similarity = 1.0
             else:
                 score.length_similarity = 1.0 if len1 == len2 == 0 else 0.0
             
@@ -4687,7 +4803,12 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             user_embedding = None
             user_embedding_dim = None
             try:
-                user_embedding = await self._get_embedding(current_message)
+                # Check cache first for user embedding
+                user_embedding = self._get_cached_user_embedding(current_message)
+                if user_embedding is None:
+                    user_embedding = await self._get_embedding(current_message)
+                    if user_embedding is not None:
+                        self._cache_user_embedding(current_message, user_embedding)
                 if user_embedding is None and not self.valves.use_llm_for_relevance:
                     logger.warning("Cannot calculate relevance — failed to generate embedding and LLM relevance is disabled.")
                     return []
@@ -4874,7 +4995,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                  uncached_ids.add(mem_id)
                              continue
 
-                        key = hash((user_embedding.tobytes(), mem_emb.tobytes()))
+                        key = str(hash((user_embedding.tobytes(), mem_emb.tobytes())))
                         cached = self.relevance_cache.get(key)
                         if cached:
                             score, ts = cached
@@ -4955,7 +5076,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                 if user_embedding is not None:
                                     mem_emb = self.memory_embeddings.get(mem_id)
                                     if mem_emb is not None:
-                                        key = hash((user_embedding.tobytes(), mem_emb.tobytes()))
+                                        key = str(hash((user_embedding.tobytes(), mem_emb.tobytes())))
                                         self.relevance_cache[key] = (score, now)
                                     else:
                                          logger.debug(f"Cannot cache relevance for {mem_id}, embedding missing.")
@@ -5945,10 +6066,10 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             logger.debug("No memory confirmation message needed")
             return
 
-        # Critical fix: Make a complete deep copy of the messages array
+        # Critical fix: Make a selective copy of the messages array
         try:
-            logger.debug("Making deep copy of messages array for safe modification")
-            messages_copy = copy.deepcopy(body["messages"])
+            logger.debug("Making selective copy of messages array for safe modification")
+            messages_copy = self._copy_messages(body["messages"])
 
             # Find the last assistant message
             last_assistant_idx = -1
@@ -6292,12 +6413,18 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                       logger.error(f"Failed to convert embedding to numpy array: {array_err}")
                       self.error_counters["embedding_errors"] += 1
                       return None
-            # Normalize just in case encode/API didn't
-            norm = np.linalg.norm(embedding_vector)
-            if norm > 1e-6: # Avoid division by zero or near-zero
-                embedding_vector = embedding_vector / norm
+            # Normalize just in case encode/API didn't - with safe bounds checking
+            if embedding_vector is not None and len(embedding_vector) > 0:
+                norm = np.linalg.norm(embedding_vector)
+                if norm > 1e-6:  # Avoid division by zero or near-zero
+                    embedding_vector = embedding_vector / norm
+                else:
+                    logger.warning("Generated embedding vector has near-zero norm. Cannot normalize.")
+                    # Return None to indicate invalid embedding
+                    return None
             else:
-                logger.warning("Generated embedding vector has near-zero norm. Cannot normalize.")
+                logger.warning("Generated embedding vector is empty or invalid")
+                return None
             
             logger.debug(f"Generated embedding via {provider_type} in {end_time - start_time:.3f}s, dim: {embedding_vector.shape}")
             EMBEDDING_LATENCY.labels(provider).observe(time.perf_counter() - _embed_start)
@@ -6526,6 +6653,42 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             logger.error(f"Error sanitizing body parameters: {e}")
             return body
     
+    def _safe_str_conversion(self, value: Any) -> str:
+        """Safely convert any value to string with proper null handling."""
+        if value is None:
+            return ''
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float, bool)):
+            return str(value)
+        if isinstance(value, (list, dict)):
+            try:
+                return str(value)
+            except Exception:
+                return ''
+        try:
+            return str(value)
+        except Exception:
+            return ''
+    
+    def _safe_int_conversion(self, value: Any, default: int = 0) -> int:
+        """Safely convert any value to integer with proper null handling."""
+        if value is None:
+            return default
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                try:
+                    return int(float(value))
+                except ValueError:
+                    return default
+        return default
+    
     def _sanitize_message(self, message: dict) -> Optional[dict]:
         """
         Sanitize a single message object to ensure it has required fields.
@@ -6536,24 +6699,31 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 
             sanitized_msg = {}
             
-            # Ensure role field exists and is valid
+            # Ensure role field exists and is valid with safe conversion
             role = message.get('role', 'user')
+            role = self._safe_str_conversion(role).lower()
             if role not in ['user', 'assistant', 'system']:
                 logger.debug(f"Invalid message role '{role}' - defaulting to 'user'")
                 role = 'user'
             sanitized_msg['role'] = role
             
-            # Ensure content field exists
+            # Ensure content field exists with safe conversion
             content = message.get('content', '')
-            if not isinstance(content, str):
-                content = str(content) if content is not None else ''
+            content = self._safe_str_conversion(content)
             sanitized_msg['content'] = content
             
-            # Preserve other safe fields
+            # Preserve other safe fields with safe conversion
             safe_fields = ['timestamp', 'id', 'metadata']
             for field in safe_fields:
                 if field in message:
-                    sanitized_msg[field] = message[field]
+                    value = message[field]
+                    # Apply safe conversion for specific fields
+                    if field == 'timestamp':
+                        sanitized_msg[field] = self._safe_str_conversion(value)
+                    elif field == 'id':
+                        sanitized_msg[field] = self._safe_str_conversion(value)
+                    else:
+                        sanitized_msg[field] = value
             
             return sanitized_msg
             
