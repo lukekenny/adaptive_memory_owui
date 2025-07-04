@@ -35,18 +35,59 @@ try:
 except ImportError:
     logger.warning("JSON repair system not available, falling back to basic parsing")
     JSON_REPAIR_AVAILABLE = False
+    
+    # Mock classes for when json_repair_system is not available
+    class EnhancedJSONParser:
+        def __init__(self):
+            self.repair_system = self
+        
+        @staticmethod
+        def parse(text: str) -> 'JSONRepairResult':
+            import json
+            try:
+                return JSONRepairResult(json.loads(text), True, "")
+            except json.JSONDecodeError as e:
+                return JSONRepairResult(None, False, str(e))
+        
+        def parse_with_repair(self, json_str: str) -> tuple[bool, dict]:
+            try:
+                import json
+                return True, json.loads(json_str)
+            except:
+                return False, {}
+        
+        def repair_json(self, json_str: str) -> str:
+            return json_str
+        
+        def validate_memory_operations(self, data: dict) -> bool:
+            """Validate memory operations format"""
+            if not isinstance(data, list):
+                return False
+            for item in data:
+                if not isinstance(item, dict):
+                    return False
+                if 'operation' not in item or 'content' not in item:
+                    return False
+            return True
+    
+    class JSONRepairResult:
+        def __init__(self, data: Any, success: bool, error: str):
+            self.data = data
+            self.success = success
+            self.error = error
 
 # ============================================================================
 # Global Variables and Mock Objects
 # ============================================================================
 
-# Filter orchestration globals
-FILTER_ROLLBACKS = {}
-COORDINATION_OVERHEAD = {}
+# Filter orchestration globals (defined below with MockMetric instances)
 _orchestration_manager = None
 
 # Mock user and memory management objects
 class MockUsers:
+    def __init__(self):
+        self.memories = MockMemories()
+        
     @staticmethod
     def get_user_by_id(user_id: str):
         """Mock user retrieval - returns a basic user object"""
@@ -76,12 +117,16 @@ class MockMetric:
     def labels(self, *args, **kwargs):
         return self
 
-# Mock metrics
-RETRIEVAL_REQUESTS = MockMetric("retrieval_requests")
-RETRIEVAL_LATENCY = MockMetric("retrieval_latency")
-EMBEDDING_REQUESTS = MockMetric("embedding_requests")
-EMBEDDING_LATENCY = MockMetric("embedding_latency")
-EMBEDDING_ERRORS = MockMetric("embedding_errors")
+# Mock metrics - typed as Any to satisfy both metric and dict usage
+RETRIEVAL_REQUESTS: Any = MockMetric("retrieval_requests")
+RETRIEVAL_LATENCY: Any = MockMetric("retrieval_latency")
+EMBEDDING_REQUESTS: Any = MockMetric("embedding_requests")
+EMBEDDING_LATENCY: Any = MockMetric("embedding_latency")
+EMBEDDING_ERRORS: Any = MockMetric("embedding_errors")
+
+# Update global metrics to use MockMetric instances  
+FILTER_ROLLBACKS: Any = MockMetric("filter_rollbacks")
+COORDINATION_OVERHEAD: Any = MockMetric("coordination_overhead")
 
 # Mock form classes
 class AddMemoryForm:
@@ -122,10 +167,45 @@ class FilterPriority(Enum):
     LOWEST = 5
 
 @dataclass
+@dataclass
 class FilterMetadata:
     name: str = "adaptive_memory"
     version: str = "4.0"
     priority: FilterPriority = FilterPriority.NORMAL
+    description: str = "Adaptive Memory Filter with persistent user memory across conversations"
+    author: str = "OpenWebUI"
+    category: str = "memory"
+    tags: List[str] = field(default_factory=list)
+    requirements: List[str] = field(default_factory=list)
+    enabled: bool = True
+    config_schema: Dict[str, Any] = field(default_factory=dict)
+    api_version: str = "1.0"
+    min_openwebui_version: str = "0.1.0"
+    max_openwebui_version: Optional[str] = None
+    dependencies: List[str] = field(default_factory=list)
+    conflicts: List[str] = field(default_factory=list)
+    last_updated: Optional[str] = None
+    changelog: List[str] = field(default_factory=list)
+    documentation_url: Optional[str] = None
+    repository_url: Optional[str] = None
+    
+    # Additional attributes needed by orchestration system
+    capabilities: List[str] = field(default_factory=lambda: ["memory", "persistent_storage", "user_context"])
+    operations: List[str] = field(default_factory=lambda: ["store", "retrieve", "search"])
+    conflicts_with: List[str] = field(default_factory=list)
+    max_execution_time_ms: int = 10000
+    memory_requirements_mb: int = 256
+    requires_user_context: bool = True
+    modifies_content: bool = True
+    thread_safe: bool = True
+    license: str = "MIT"
+    keywords: List[str] = field(default_factory=list)
+    environment: Dict[str, Any] = field(default_factory=dict)
+    resources: Dict[str, Any] = field(default_factory=dict)
+    permissions: List[str] = field(default_factory=list)
+    data_retention: Optional[int] = None
+    privacy_policy: Optional[str] = None
+    terms_of_service: Optional[str] = None
 
 # Simplified orchestration system - most functionality moved to the main Filter class
 class SimpleOrchestrator:
@@ -2111,9 +2191,9 @@ Analyze the following related memories and provide a concise summary.""",
                             form_data=QueryMemoryForm(query=memory_id, k=1000) # Query broadly first
                         )
                         target_memory = None
-                        if query_result and query_result.memories:
+                        if query_result and hasattr(query_result, 'memories') and query_result.memories:
                             for mem in query_result.memories:
-                                if mem.id == memory_id:
+                                if hasattr(mem, 'id') and mem.id == memory_id:
                                     target_memory = mem
                                     break
 
@@ -4099,8 +4179,8 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
         decision_factors: List[str] = field(default_factory=list)
     
     def _calculate_enhanced_confidence_score(self, new_content: str, existing_content: str,
-                                           new_memory_data: Dict[str, Any] = None,
-                                           existing_memory_data: Dict[str, Any] = None) -> DuplicateConfidenceScore:
+                                           new_memory_data: Optional[Dict[str, Any]] = None,
+                                           existing_memory_data: Optional[Dict[str, Any]] = None) -> DuplicateConfidenceScore:
         score = self.DuplicateConfidenceScore()
         if new_memory_data is None:
             new_memory_data = {"content": new_content, "tags": []}
@@ -5052,7 +5132,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         logger.error(formatted_msg)
         return formatted_msg
 
-    def _handle_validation_error(self, field_name: str, value: any, expected_type: str = None) -> bool:
+    def _handle_validation_error(self, field_name: str, value: Any, expected_type: Optional[str] = None) -> bool:
         """Consolidated validation error handling."""
         if expected_type:
             logger.warning(f"Validation failed for {field_name}: expected {expected_type}, got {type(value)}")
@@ -5073,9 +5153,9 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                          data: dict, 
                                          headers: dict,
                                          provider_type: str,
-                                         max_retries: int = None,
-                                         retry_delay: float = None,
-                                         request_timeout: float = None) -> tuple[bool, Union[dict, str]]:
+                                         max_retries: Optional[int] = None,
+                                         retry_delay: Optional[float] = None,
+                                         request_timeout: Optional[float] = None) -> tuple[bool, Union[dict, str]]:
         """
         Unified API request method with retry logic for both LLM and embedding requests.
         
@@ -6133,7 +6213,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             logger.error(f"Error sanitizing body parameters: {e}")
             return body
     
-    def _sanitize_message(self, message: dict) -> dict:
+    def _sanitize_message(self, message: dict) -> Optional[dict]:
         """
         Sanitize a single message object to ensure it has required fields.
         """
