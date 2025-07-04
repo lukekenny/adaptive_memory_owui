@@ -4390,9 +4390,20 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             # 3. Embedding Similarity (if embeddings available)
             if self.valves.use_embeddings_for_deduplication and self._local_embedding_model:
                 try:
-                    # Calculate embedding similarity
-                    embedding_sim = asyncio.run(self._calculate_embedding_similarity(new_content, existing_content))
-                    score.embedding_similarity = embedding_sim
+                    # Calculate embedding similarity - use sync fallback for non-async context
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            # Already in async context - cannot use asyncio.run
+                            logger.debug("Skipping embedding similarity calculation in async context")
+                            score.embedding_similarity = 0.0
+                        else:
+                            embedding_sim = loop.run_until_complete(self._calculate_embedding_similarity(new_content, existing_content))
+                            score.embedding_similarity = embedding_sim
+                    except RuntimeError:
+                        # No event loop - safe to use asyncio.run
+                        embedding_sim = asyncio.run(self._calculate_embedding_similarity(new_content, existing_content))
+                        score.embedding_similarity = embedding_sim
                 except Exception as e:
                     logger.debug(f"Error calculating embedding similarity: {e}")
                     score.embedding_similarity = 0.0
@@ -6535,28 +6546,12 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 logger.warning("Sync inlet: No user info available, skipping processing")
                 return normalized_body
             
-            # Create a new event loop if needed (for sync context)
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # We're already in an async context, create a task
-                    task = asyncio.create_task(self.async_inlet(normalized_body, __event_emitter__, user_info))
-                    # Wait for completion with a timeout
-                    asyncio.ensure_future(task)
-                    # Can't use await in sync function, so we use a different approach
-                    logger.warning("Sync inlet called from async context - returning body unchanged")
-                    return normalized_body
-                else:
-                    # We can run the async method
-                    return loop.run_until_complete(self.async_inlet(normalized_body, __event_emitter__, user_info))
-            except RuntimeError:
-                # No event loop, create one
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    return loop.run_until_complete(self.async_inlet(normalized_body, __event_emitter__, user_info))
-                finally:
-                    loop.close()
+            # Improved event loop management for OpenWebUI 2024
+            return self._run_async_in_sync_context(
+                self.async_inlet(normalized_body, __event_emitter__, user_info),
+                "inlet",
+                normalized_body
+            )
                     
         except Exception as e:
             logger.error(f"Error in sync inlet: {e}\n{traceback.format_exc()}")
@@ -6586,29 +6581,68 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 logger.warning("Sync outlet: No user info available, skipping processing")
                 return normalized_body
             
-            # Create a new event loop if needed (for sync context)
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # We're already in an async context
-                    logger.warning("Sync outlet called from async context - returning body unchanged")
-                    return normalized_body
-                else:
-                    # We can run the async method
-                    return loop.run_until_complete(self.async_outlet(normalized_body, __event_emitter__, user_info))
-            except RuntimeError:
-                # No event loop, create one
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    return loop.run_until_complete(self.async_outlet(normalized_body, __event_emitter__, user_info))
-                finally:
-                    loop.close()
+            # Improved event loop management for OpenWebUI 2024
+            return self._run_async_in_sync_context(
+                self.async_outlet(normalized_body, __event_emitter__, user_info),
+                "outlet",
+                normalized_body
+            )
                     
         except Exception as e:
             logger.error(f"Error in sync outlet: {e}\n{traceback.format_exc()}")
             # Never raise exceptions - return body unchanged
             return body
+    
+    def _run_async_in_sync_context(self, coro, method_name: str, fallback_body: dict) -> dict:
+        """
+        Safely run async coroutine in sync context following OpenWebUI 2024 patterns.
+        Handles event loop management and resource cleanup properly.
+        
+        Args:
+            coro: The async coroutine to run
+            method_name: Name of the calling method for logging
+            fallback_body: Body to return if async execution fails
+            
+        Returns:
+            Result of async execution or fallback_body on error
+        """
+        try:
+            # Check if we're in an async context
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # Already in async context - cannot use run_until_complete
+                    logger.warning(f"Sync {method_name} called from async context - returning body unchanged")
+                    return fallback_body
+                else:
+                    # Existing loop not running - safe to use
+                    return loop.run_until_complete(coro)
+            except RuntimeError:
+                # No event loop exists - create temporary one
+                loop = None
+                try:
+                    loop = asyncio.new_event_loop()
+                    # Don't set as default loop to avoid conflicts
+                    return loop.run_until_complete(coro)
+                finally:
+                    # Always clean up the loop we created
+                    if loop:
+                        try:
+                            # Cancel all pending tasks
+                            pending = asyncio.all_tasks(loop)
+                            for task in pending:
+                                task.cancel()
+                            # Wait for tasks to complete cancellation
+                            if pending:
+                                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                        except Exception as cleanup_error:
+                            logger.debug(f"Error cleaning up loop tasks: {cleanup_error}")
+                        finally:
+                            loop.close()
+                            
+        except Exception as e:
+            logger.error(f"Error in {method_name} async execution: {e}\\n{traceback.format_exc()}")
+            return fallback_body
     
     def stream(self, event: dict, **kwargs) -> dict:
         """
