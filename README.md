@@ -22,7 +22,7 @@ OpenWebUI functions are installed by copying the code directly into the OpenWebU
 2. **Add the Function**
    - Go to "Workspace" → "Functions"
    - Click the "+" button to add a new function
-   - Copy the entire contents of `adaptive_memory_v4.0.py`
+   - Copy the entire contents of **`adaptive_memory_v4.0.py`** (the only file you need)
    - Paste into the code editor
    - Click "Save"
 
@@ -74,9 +74,10 @@ The filter includes configurable valves for:
 ## File Structure
 
 ```
-adaptive_memory_v4.0.py    # Main filter file (copy this to OpenWebUI)
+adaptive_memory_v4.0.py    # Main filter file (copy this to OpenWebUI) - THE ONLY FILE YOU NEED
 requirements.txt           # Dependencies reference (for development only)
-tests/                     # Test suite (for development only)
+Other Versions/            # Previous versions for reference
+OWUI tech-docs/           # OpenWebUI architecture documentation
 ```
 
 ## Troubleshooting
