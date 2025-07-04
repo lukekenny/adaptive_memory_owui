@@ -20,10 +20,101 @@ import numpy as np
 import aiohttp
 from aiohttp import ClientTimeout, TCPConnector, ClientError
 
-# Setup logging
-logger = logging.getLogger(__name__)
-handler = logging.StreamHandler()
-handler.setLevel(logging.INFO)
+# Setup structured logging for Docker environments
+logger = logging.getLogger("adaptive_memory")
+
+# Create custom formatter for structured logs
+class DockerFormatter(logging.Formatter):
+    """Custom formatter for Docker-friendly structured logs"""
+    
+    COMPONENT_COLORS = {
+        'INLET': '\033[36m',      # Cyan
+        'OUTLET': '\033[35m',     # Magenta
+        'MEMORY': '\033[33m',     # Yellow
+        'CONFIG': '\033[34m',     # Blue
+        'EMBED': '\033[32m',      # Green
+        'LLM': '\033[31m',        # Red
+        'FILTER': '\033[37m',     # White
+        'ERROR': '\033[91m',      # Bright Red
+        'SUCCESS': '\033[92m',    # Bright Green
+    }
+    RESET = '\033[0m'
+    
+    def format(self, record):
+        # Extract component from logger name or message
+        component = getattr(record, 'component', 'SYSTEM')
+        user_id = getattr(record, 'user_id', 'system')
+        operation = getattr(record, 'operation', '')
+        
+        # Get color for component
+        color = self.COMPONENT_COLORS.get(component, '')
+        
+        # Format timestamp
+        timestamp = datetime.now(timezone.utc).isoformat()
+        
+        # Build structured message
+        if record.levelno >= logging.ERROR:
+            color = self.COMPONENT_COLORS['ERROR']
+            prefix = f"{color}[{timestamp}] [{component}] [ERROR] [user:{user_id}]{self.RESET}"
+        elif record.levelno >= logging.WARNING:
+            prefix = f"{color}[{timestamp}] [{component}] [WARN] [user:{user_id}]{self.RESET}"
+        else:
+            prefix = f"{color}[{timestamp}] [{component}] [INFO] [user:{user_id}]{self.RESET}"
+        
+        if operation:
+            prefix += f" [{operation}]"
+        
+        # Add context if available
+        context = getattr(record, 'context', {})
+        if context:
+            context_str = ' '.join([f"{k}={v}" for k, v in context.items()])
+            prefix += f" {{{context_str}}}"
+        
+        # Format the actual message
+        message = f"{prefix} {record.getMessage()}"
+        
+        # Add exception info if present
+        if record.exc_info:
+            exception_text = self.formatException(record.exc_info)
+            message += f"\n{color}EXCEPTION DETAILS:{self.RESET}\n{exception_text}"
+        
+        return message
+
+# Configure handler with custom formatter (only once)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = DockerFormatter()
+    handler.setFormatter(formatter)
+    
+    # Set appropriate log level based on environment
+    log_level = os.environ.get('ADAPTIVE_MEMORY_LOG_LEVEL', 'INFO')
+    handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    logger.addHandler(handler)
+    logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    logger.propagate = False  # Prevent duplicate logs from root logger
+
+# Helper function for structured logging
+def log_with_context(level: str, message: str, component: str = 'SYSTEM', 
+                     user_id: str = 'system', operation: str = '', 
+                     context: Optional[Dict[str, Any]] = None, 
+                     error: Optional[Exception] = None,
+                     exc_info: bool = False):
+    """Log with structured context for Docker environments"""
+    extra = {
+        'component': component,
+        'user_id': user_id,
+        'operation': operation,
+        'context': context or {}
+    }
+    
+    if error:
+        # Add error details to context
+        extra['context']['error_type'] = type(error).__name__
+        extra['context']['error_msg'] = str(error)
+        exc_info = True  # Force exc_info when error is provided
+    
+    log_func = getattr(logger, level.lower(), logger.info)
+    log_func(message, extra=extra, exc_info=exc_info)
 
 # Import OpenWebUI classes if available
 try:
@@ -40,7 +131,7 @@ try:
     from json_repair_system import EnhancedJSONParser  # type: ignore
     JSON_REPAIR_AVAILABLE = True
 except ImportError:
-    logger.warning("JSON repair system not available, falling back to basic parsing")
+    logger.info("JSON repair system not available, using basic parsing")
     JSON_REPAIR_AVAILABLE = False
     
     # Mock classes for when json_repair_system is not available
@@ -206,17 +297,20 @@ class QueryMemoryForm:
 # Mock async functions
 async def add_memory(user_id: str, form_data: AddMemoryForm):
     """Mock add memory function"""
-    logger.info(f"Mock: Adding memory for user {user_id}: {form_data.content[:50]}...")
+    log_with_context('debug', f"Mock: Adding memory - {form_data.content[:50]}...",
+                     component='MEMORY', user_id=user_id, operation='add_mock')
     return {"success": True, "memory_id": str(uuid.uuid4())}
 
 async def delete_memory_by_id(user_id: str, memory_id: str):
     """Mock delete memory function"""
-    logger.info(f"Mock: Deleting memory {memory_id} for user {user_id}")
+    log_with_context('debug', f"Mock: Deleting memory {memory_id}",
+                     component='MEMORY', user_id=user_id, operation='delete_mock')
     return {"success": True}
 
 async def query_memory(user_id: str, form_data: QueryMemoryForm):
     """Mock query memory function"""
-    logger.info(f"Mock: Querying memory for user {user_id}: {form_data.query[:50]}...")
+    log_with_context('debug', f"Mock: Querying memory - {form_data.query[:50]}...",
+                     component='MEMORY', user_id=user_id, operation='query_mock')
     return {"results": []}
 
 # Simplified Filter Orchestration System for single filter use
@@ -301,10 +395,11 @@ class JsonFormatter(logging.Formatter):
         return _json.dumps(log_record)
 
 
-formatter = JsonFormatter()
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-logger.propagate = False # Prevent duplicate logs if root logger has handlers
+# JsonFormatter setup removed - using DockerFormatter above to prevent duplicate handlers
+# The handler is already configured above with DockerFormatter
+
+# Helper function for structured logging
+# Duplicate function removed - using the one defined at line 95
 # Do not override root logger level; respect GLOBAL_LOG_LEVEL or root config
 
 
@@ -709,7 +804,8 @@ class Filter:
             SecurityError: If model name contains suspicious patterns
         """
         if not model_name or not isinstance(model_name, str):
-            logger.warning(f"Invalid embedding model name type: {type(model_name)}. Using default.")
+            log_with_context('warning', f"Invalid embedding model name type: {type(model_name)}. Using default.",
+                           component='EMBED', operation='validate_model')
             return 'all-MiniLM-L6-v2'
         
         # Remove dangerous characters and patterns
@@ -728,14 +824,16 @@ class Filter:
         
         for pattern in suspicious_patterns:
             if re.search(pattern, model_name):
-                logger.error(f"Security violation: Suspicious pattern detected in model name: {model_name}")
-                logger.error(f"Pattern matched: {pattern}")
+                log_with_context('error', f"Security violation: Suspicious pattern in model name",
+                               component='EMBED', operation='validate_model',
+                               context={'model_name': model_name, 'pattern': pattern})
                 return 'all-MiniLM-L6-v2'  # Return safe default
         
         # Check against whitelist
         if model_name not in Filter.ALLOWED_EMBEDDING_MODELS:
-            logger.warning(f"Embedding model '{model_name}' not in allowed list. Using default 'all-MiniLM-L6-v2'.")
-            logger.info(f"Allowed models: {sorted(Filter.ALLOWED_EMBEDDING_MODELS)}")
+            log_with_context('warning', f"Embedding model '{model_name}' not in allowed list. Using default.",
+                           component='EMBED', operation='validate_model',
+                           context={'requested': model_name, 'allowed': sorted(Filter.ALLOWED_EMBEDDING_MODELS)})
             return 'all-MiniLM-L6-v2'
         
         return model_name
@@ -750,7 +848,8 @@ class Filter:
                 # Security: Validate model name before loading
                 raw_model_name = self.valves.embedding_model_name if self.valves.embedding_provider_type == 'local' else 'all-MiniLM-L6-v2'
                 local_model_name = self._validate_embedding_model_name(raw_model_name)
-                logger.info(f"Loading validated embedding model: {local_model_name}")
+                log_with_context('info', f"Loading validated embedding model: {local_model_name}",
+                               component='EMBED', operation='load_model')
                 self._embedding_model = SentenceTransformer(local_model_name)
             except ImportError as e:
                 error = EmbeddingModelLoadError(
@@ -790,7 +889,8 @@ class Filter:
                     # Security: Validate model name before loading
                     raw_model_name = self.valves.embedding_model_name if self.valves.embedding_provider_type == 'local' else 'all-MiniLM-L6-v2'
                     local_model_name = self._validate_embedding_model_name(raw_model_name)
-                    logger.info(f"Loading validated embedding model: {local_model_name}")
+                    log_with_context('info', f"Loading validated embedding model: {local_model_name}",
+                                   component='EMBED', operation='load_model_async')
                     return SentenceTransformer(local_model_name)
                 except ImportError as e:
                     error = EmbeddingModelLoadError(
@@ -843,7 +943,10 @@ class Filter:
             keys_to_remove = list(self._memory_embeddings.keys())[:len(self._memory_embeddings) - 800]
             for key in keys_to_remove:
                 del self._memory_embeddings[key]
-            logger.info(f"Cleaned up {len(keys_to_remove)} old embedding entries")
+            if len(keys_to_remove) > 0:
+                log_with_context('info', f"Cleaned up {len(keys_to_remove)} old embedding entries",
+                               component='MEMORY', operation='cleanup_embeddings',
+                               context={'removed_count': len(keys_to_remove)})
         
         return self._memory_embeddings
 
@@ -858,7 +961,10 @@ class Filter:
             keys_to_remove = list(self._relevance_cache.keys())[:len(self._relevance_cache) - 400]
             for key in keys_to_remove:
                 del self._relevance_cache[key]
-            logger.info(f"Cleaned up {len(keys_to_remove)} old relevance cache entries")
+            if len(keys_to_remove) > 0:
+                log_with_context('info', f"Cleaned up {len(keys_to_remove)} old relevance cache entries",
+                               component='MEMORY', operation='cleanup_relevance',
+                               context={'removed_count': len(keys_to_remove)})
         
         return self._relevance_cache
 
@@ -936,13 +1042,13 @@ class Filter:
         )
         
         llm_provider: Literal["ollama", "openai_compatible", "gemini"] = Field(
-            default="ollama",
-            description="🤖 LLM Provider: 'ollama' = local Ollama, 'openai_compatible' = API services, 'gemini' = Google AI"
+            default="openai_compatible",
+            description="🤖 LLM Provider: 'openai_compatible' = API services (recommended), 'ollama' = local Ollama, 'gemini' = Google AI"
         )
         
         llm_model_name: str = Field(
-            default="llama3.3:70b",
-            description="📝 Model Name: e.g., 'llama3.3:70b' (Ollama), 'gpt-4o' (OpenAI), 'gemini-2.0-flash-exp' (Google)"
+            default="gpt-4o-mini",
+            description="📝 Model Name: e.g., 'gpt-4o-mini' (OpenAI), 'llama3.3:70b' (Ollama), 'gemini-2.0-flash-exp' (Google)"
         )
         
         memory_mode: Literal["minimal", "balanced", "comprehensive"] = Field(
@@ -960,7 +1066,7 @@ class Filter:
         )
         
         llm_api_endpoint_url: str = Field(
-            default="http://host.docker.internal:11434/api/chat",
+            default="https://api.openai.com/v1/chat/completions",
             description="🌐 API Endpoint: Full URL to your LLM service (auto-detected for most providers)"
         )
         
@@ -1278,7 +1384,9 @@ Analyze the following related memories and provide a concise summary.""",
         def validate_embedding_model_name(cls, v):
             """Validate embedding model name for security"""
             if not v or not isinstance(v, str):
-                logger.warning(f"Invalid embedding model name: {v}. Using default.")
+                log_with_context('warning', "Invalid embedding model name in config. Using default.",
+                           component='CONFIG', operation='validate_config',
+                           context={'invalid_value': v, 'type': type(v).__name__})
                 return 'all-MiniLM-L6-v2'
             
             # Basic validation - full validation happens in Filter class
@@ -1288,7 +1396,9 @@ Analyze the following related memories and provide a concise summary.""",
             
             # Check for obviously malicious patterns
             if any(char in v for char in [';', '|', '&', '`', '$', '(', ')', '\\']):
-                logger.error(f"Security violation: Suspicious characters in embedding model name: {v}")
+                log_with_context('error', "Security violation: Suspicious characters in embedding model name",
+                               component='CONFIG', operation='validate_config',
+                               context={'model_name': v})
                 return 'all-MiniLM-L6-v2'
             
             return v
@@ -1298,13 +1408,27 @@ Analyze the following related memories and provide a concise summary.""",
             """Auto-configure settings based on setup_mode and memory_mode"""
             
             # Auto-configure API endpoints based on provider
-            if self.llm_provider == "ollama" and self.llm_api_endpoint_url == "http://host.docker.internal:11434/api/chat":
-                # Keep default for Ollama
-                pass
-            elif self.llm_provider == "openai_compatible" and not self.llm_api_key:
-                raise ValueError("🔑 API Key required for OpenAI-compatible providers")
+            if self.llm_provider == "ollama":
+                # Configure Ollama endpoint
+                if self.llm_api_endpoint_url == "https://api.openai.com/v1/chat/completions":
+                    self.llm_api_endpoint_url = "http://host.docker.internal:11434/api/chat"
+            elif self.llm_provider == "openai_compatible":
+                # Configure OpenAI endpoint
+                if self.llm_api_endpoint_url == "http://host.docker.internal:11434/api/chat":
+                    self.llm_api_endpoint_url = "https://api.openai.com/v1/chat/completions"
+                # Only require API key if not using a local or test environment
+                if not self.llm_api_key:
+                    log_with_context(
+                        "WARNING", 
+                        "No API key provided for OpenAI-compatible provider. Filter will work but LLM features may fail.", 
+                        component="CONFIG"
+                    )
             elif self.llm_provider == "gemini" and not self.llm_api_key:
-                raise ValueError("🔑 API Key required for Google Gemini")
+                log_with_context(
+                    "WARNING", 
+                    "No API key provided for Google Gemini. Filter will work but LLM features may fail.", 
+                    component="CONFIG"
+                )
             
             # Auto-configure user-visible settings based on memory_mode if in simple setup
             if self.setup_mode == "simple":
@@ -1544,10 +1668,12 @@ Analyze the following related memories and provide a concise summary.""",
         # Initialize JSON repair system
         if JSON_REPAIR_AVAILABLE:
             self._json_parser = EnhancedJSONParser()
-            logger.info("JSON repair system initialized")
+            log_with_context('info', "JSON repair system initialized",
+                           component='CONFIG', operation='init_json_repair')
         else:
             self._json_parser = None
-            logger.warning("JSON repair system not available, using basic parsing")
+            log_with_context('info', "JSON repair system not available, using basic parsing",
+                           component='CONFIG', operation='init_json_repair')
 
         from collections import deque
         self.error_timestamps = {"json_parse_errors": deque()}
@@ -1706,9 +1832,11 @@ Analyze the following related memories and provide a concise summary.""",
                         task.cancel()
                 self._background_tasks.clear()
             
-            logger.info("Memory resources cleaned up successfully")
+            log_with_context('debug', "Memory resources cleaned up successfully",
+                           component='MEMORY', operation='cleanup')
         except Exception as e:
-            logger.error(f"Error during memory cleanup: {e}")
+            log_with_context('error', "Error during memory cleanup",
+                           component='MEMORY', operation='cleanup', error=e)
 
     def _initialize_filter_orchestration(self):
         try:
@@ -1747,7 +1875,9 @@ Analyze the following related memories and provide a concise summary.""",
             return
         try:
             execution_time = (time.time() - start_time) * 1000
-            logger.warning(f"Operation {operation} failed after {execution_time}ms: {error}")
+            log_with_context('warning', f"Operation failed after {execution_time}ms",
+                           component='MEMORY', operation=operation,
+                           context={'execution_time_ms': execution_time, 'error': str(error)})
         except:
             pass
 
@@ -1767,7 +1897,9 @@ Analyze the following related memories and provide a concise summary.""",
                 # Remove oldest entries
                 self._rollback_stack = self._rollback_stack[-max_rollback_entries:]
         except Exception as e:
-            logger.warning(f"Failed to create rollback point: {e}")
+            log_with_context('warning', "Failed to create rollback point",
+                           component='MEMORY', operation='create_rollback',
+                           error=e)
             pass
 
     def _add_background_task(self, coro):
@@ -1787,7 +1919,8 @@ Analyze the following related memories and provide a concise summary.""",
             return task
         except RuntimeError:
             # No event loop running, skip background task creation
-            logger.debug("No event loop running, skipping background task creation")
+            log_with_context('debug', "No event loop running, skipping background task creation",
+                           component='MEMORY', operation='rollback_async')
             return None
 
     def _perform_rollback(self, rollback_id: Optional[str] = None) -> bool:
@@ -1808,7 +1941,9 @@ Analyze the following related memories and provide a concise summary.""",
                 rollback_entry = self._rollback_stack[-1]
             
             if not rollback_entry:
-                logger.warning(f"Rollback point not found: {rollback_id}")
+                log_with_context('warning', f"Rollback point not found: {rollback_id}",
+                               component='MEMORY', operation='rollback',
+                               context={'rollback_id': rollback_id})
                 return False
             
             # Restore state (implementation depends on what was saved)
@@ -1817,11 +1952,15 @@ Analyze the following related memories and provide a concise summary.""",
             
             FILTER_ROLLBACKS.labels(reason=f"rollback_{operation}").inc()
             
-            logger.info(f"Performed rollback for operation: {operation}")
+            log_with_context('info', f"Performed rollback for operation: {operation}",
+                           component='MEMORY', operation='rollback',
+                           context={'rollback_operation': operation})
             return True
             
         except Exception as e:
-            logger.error(f"Failed to perform rollback: {e}")
+            log_with_context('error', "Failed to perform rollback",
+                           component='MEMORY', operation='rollback',
+                           error=e)
             FILTER_ROLLBACKS.labels(reason="rollback_error").inc()
             return False
 
@@ -1879,7 +2018,9 @@ Analyze the following related memories and provide a concise summary.""",
                              # Mark as None if no text to prevent repeated attempts
                              self.memory_embeddings[mem_id] = None
                     except Exception as e:
-                        logger.warning(f"Failed to generate embedding for memory {mem_id} during clustering: {e}")
+                        log_with_context('warning', f"Failed to generate embedding for memory during clustering",
+                                       component='MEMORY', operation='clustering',
+                                       context={'memory_id': mem_id}, error=e)
                         self.memory_embeddings[mem_id] = None # Mark as failed
             
             # Optimized clustering using precomputed similarities
@@ -1941,7 +2082,9 @@ Analyze the following related memories and provide a concise summary.""",
                             unprocessed_memories.pop(j)
                             continue  # Don't increment j as we removed an element
                     except Exception as e:
-                        logger.warning(f"Error comparing embeddings for {current_id} and {other_id}: {e}")
+                        log_with_context('warning', "Error comparing embeddings during clustering",
+                                       component='MEMORY', operation='clustering',
+                                       context={'current_id': current_id, 'other_id': other_id}, error=e)
                     
                     j += 1
                 
@@ -2044,11 +2187,14 @@ Analyze the following related memories and provide a concise summary.""",
                                 except:
                                     pass
                 if summarized_count > 0:
-                    logger.info(f"Generated {summarized_count} summaries, deleted {deleted_count} memories")
+                    log_with_context('info', "Memory summarization completed",
+                                   component='MEMORY', operation='summarize',
+                                   context={'summaries_created': summarized_count, 'memories_deleted': deleted_count})
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Summarization error: {e}")
+                log_with_context('error', "Memory summarization failed",
+                               component='MEMORY', operation='summarize', error=e)
 
     def _update_date_info(self):
         d = self.current_date
@@ -2080,7 +2226,9 @@ Analyze the following related memories and provide a concise summary.""",
             try:
                 await asyncio.sleep(self.internal_config.error_logging_interval * random.uniform(0.9, 1.1))
                 if self.internal_config.debug_error_counter_logs or any(self.error_counters.values()):
-                    logger.info(f"Error counters: {self.error_counters}")
+                    log_with_context('info', "Error counter summary",
+                                   component='MEMORY', operation='error_stats',
+                                   context={'counters': dict(self.error_counters)})
 
                 if self.valves.enable_error_counter_guard:
                     now = time.time()
@@ -2121,7 +2269,8 @@ Analyze the following related memories and provide a concise summary.""",
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                logger.error(f"Error in date update task: {e}")
+                log_with_context('error', "Error in date update task",
+                               component='MEMORY', operation='update_dates', error=e)
 
         # Start the update loop in the background
         task = asyncio.create_task(update_date_loop())
@@ -2152,7 +2301,8 @@ Analyze the following related memories and provide a concise summary.""",
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
-                        logger.error(f"Error in model discovery: {e}")
+                        log_with_context('error', "Error in model discovery",
+                                       component='CONFIG', operation='discover_models', error=e)
                         # On error, retry sooner (1/6 of normal interval)
                         await asyncio.sleep(self.internal_config.model_discovery_interval / 6)
             except asyncio.CancelledError:
@@ -2204,12 +2354,15 @@ Analyze the following related memories and provide a concise summary.""",
             local_tz = pytz.timezone(timezone_str)
             return utc_now.astimezone(local_tz)
         except pytz.exceptions.UnknownTimeZoneError:
-            logger.warning(f"Invalid timezone: {timezone_str}, falling back to default 'Asia/Dubai'.")
+            log_with_context('warning', f"Invalid timezone: {timezone_str}, using default",
+                           component='CONFIG', operation='validate_timezone',
+                           context={'requested': timezone_str, 'default': 'Asia/Dubai'})
             try:
                 local_tz = pytz.timezone("Asia/Dubai")
                 return datetime.now(timezone.utc).astimezone(local_tz)
             except Exception:
-                logger.warning("Fallback timezone also invalid, using UTC")
+                log_with_context('warning', "Fallback timezone also invalid, using UTC",
+                               component='CONFIG', operation='validate_timezone')
                 return datetime.now(timezone.utc)
 
     def _get_circuit_breaker_key(self, api_url: str, provider_type: str) -> str:
@@ -2223,7 +2376,9 @@ Analyze the following related memories and provide a concise summary.""",
         current_time = time.time()
         timeout_duration = self.internal_config.circuit_breaker_timeout
         if current_time - state.get("last_failure", 0) > timeout_duration:
-            logger.info(f"Circuit breaker reset for {key}")
+            log_with_context('debug', f"Circuit breaker reset for {key}",
+                           component='FILTER', operation='circuit_breaker_reset',
+                           context={'breaker_key': key})
             state["is_open"] = False
             state["failures"] = 0
             self._circuit_breaker_state[key] = state
@@ -2267,10 +2422,14 @@ Analyze the following related memories and provide a concise summary.""",
                 self._connection_health[key] = is_healthy
                 self._last_health_check[key] = current_time
                 if not is_healthy:
-                    logger.warning(f"Health check failed for {key}: status {response.status}")
+                    log_with_context('warning', f"Health check failed for {key}",
+                                   component='FILTER', operation='health_check',
+                                   context={'key': key, 'status': response.status})
                 return is_healthy
         except Exception as e:
-            logger.warning(f"Health check failed for {key}: {e}")
+            log_with_context('warning', f"Health check failed for {key}",
+                           component='FILTER', operation='health_check',
+                           context={'key': key}, error=e)
             self._connection_health[key] = False
             self._last_health_check[key] = current_time
             return False
@@ -2318,7 +2477,8 @@ Analyze the following related memories and provide a concise summary.""",
         
         # Check if circuit should be reset
         if self.memory_processing_circuit_open and current_time > self.memory_processing_circuit_reset_time:
-            logger.info("Memory processing circuit breaker reset - reopening")
+            log_with_context('info', "Memory processing circuit breaker reset - reopening",
+                           component='MEMORY', operation='circuit_breaker_reset')
             self.memory_processing_circuit_open = False
             self.memory_processing_failures = 0
             
@@ -2354,7 +2514,9 @@ Analyze the following related memories and provide a concise summary.""",
         max_ops = getattr(self.valves, 'max_memory_operations_per_message', 20)
         
         if len(operations) > max_ops:
-            logger.warning(f"Limiting memory operations from {len(operations)} to {max_ops} to prevent system overload")
+            log_with_context('warning', "Limiting memory operations to prevent overload",
+                           component='MEMORY', operation='rate_limit',
+                           context={'requested': len(operations), 'limited_to': max_ops})
             # Keep the highest confidence operations
             sorted_ops = sorted(operations, key=lambda x: x.get('confidence', 0), reverse=True)
             return sorted_ops[:max_ops]
@@ -2367,7 +2529,9 @@ Analyze the following related memories and provide a concise summary.""",
             match = re.search(pattern, user_message.lower(), re.IGNORECASE)
             if match:
                 content = f"User preference: {match.group(0).strip()}"
-                logger.info(f"Created fallback memory from preference pattern: {content}")
+                log_with_context('info', "Created fallback memory from preference pattern",
+                               component='MEMORY', operation='create_fallback',
+                               context={'content_preview': content[:50] + '...' if len(content) > 50 else content})
                 return [{"operation": "NEW", "content": content, "tags": ["preference"], "memory_bank": "General", "confidence": 0.6}]
         return []
 
@@ -2386,7 +2550,8 @@ Analyze the following related memories and provide a concise summary.""",
             if self._session_connector and not self._session_connector.closed:
                 await self._session_connector.close()
         except Exception as e:
-            logger.warning(f"Error during connection cleanup: {e}")
+            log_with_context('warning', "Error during connection cleanup",
+                           component='FILTER', operation='cleanup_connections', error=e)
         finally:
             self._aiohttp_session = None
             self._session_connector = None
@@ -2444,12 +2609,15 @@ Analyze the following related memories and provide a concise summary.""",
                 self._circuit_breaker_state[key] = {"failures": 0, "last_failure": 0, "is_open": False}
                 reset_info["reset_count"] = 1
                 reset_info["reset_endpoints"].append(key)
-                logger.info(f"Reset circuit breaker for {key}")
+                log_with_context('debug', f"Reset circuit breaker for {key}",
+                               component='FILTER', operation='reset_circuit_breaker',
+                               context={'key': key})
         else:
             reset_info["reset_count"] = len(self._circuit_breaker_state)
             reset_info["reset_endpoints"] = list(self._circuit_breaker_state.keys())
             self._circuit_breaker_state.clear()
-            logger.info("Reset all circuit breakers")
+            log_with_context('debug', "Reset all circuit breakers",
+                           component='FILTER', operation='reset_all_breakers')
         return reset_info
     
     async def test_llm_connection(self, timeout: float = 30.0) -> Dict[str, Any]:
@@ -2500,7 +2668,9 @@ Analyze the following related memories and provide a concise summary.""",
                 timeout=120.0  # 2 minutes max for inlet processing
             )
         except asyncio.TimeoutError:
-            logger.error("async_inlet operation timed out after 120 seconds")
+            user_id = __user__.get('id', 'unknown') if __user__ else 'unknown'
+            log_with_context('error', "Inlet operation timed out after 120 seconds",
+                           component='INLET', user_id=user_id, operation='timeout')
             # Use enhanced event emitter for 2024 compliance
             await self._emit_enhanced_event(
                 __event_emitter__, 
@@ -2511,7 +2681,9 @@ Analyze the following related memories and provide a concise summary.""",
             )
             return body
         except Exception as e:
-            logger.error(f"Critical error in async_inlet: {e}")
+            user_id = __user__.get('id', 'unknown') if __user__ else 'unknown'
+            log_with_context('error', "Critical error in inlet processing",
+                           component='INLET', user_id=user_id, operation='error', error=e)
             # Use enhanced event emitter for 2024 compliance
             await self._emit_enhanced_event(
                 __event_emitter__, 
@@ -2529,9 +2701,9 @@ Analyze the following related memories and provide a concise summary.""",
         __user__: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Implementation of async_inlet with timeout protection"""
-        logger.debug(
-            f"Inlet received body keys: {list(body.keys())} for user: {__user__.get('id', 'N/A') if __user__ else 'N/A'}"
-        )
+        user_id = __user__.get('id', 'unknown') if __user__ else 'unknown'
+        log_with_context('debug', f"Inlet received body keys: {list(body.keys())}",
+                        component='INLET', user_id=user_id, operation='receive')
 
         # Ensure configuration persistence at start of operation (with timeout)
         try:
@@ -2540,11 +2712,14 @@ Analyze the following related memories and provide a concise summary.""",
                 timeout=5.0
             )
             if not config_check:
-                logger.warning("Configuration persistence check failed in async_inlet, but continuing with current config")
+                log_with_context('warning', "Configuration persistence check failed, continuing with current config",
+                               component='INLET', user_id=user_id, operation='config_check')
         except asyncio.TimeoutError:
-            logger.warning("Configuration persistence check timed out in async_inlet, continuing with current config")
+            log_with_context('warning', "Configuration persistence check timed out, continuing with current config",
+                           component='INLET', user_id=user_id, operation='config_check')
         except Exception as e:
-            logger.warning(f"Configuration persistence check error in async_inlet: {e}, continuing with current config")
+            log_with_context('warning', "Configuration persistence check error, continuing with current config",
+                           component='INLET', user_id=user_id, operation='config_check', error=e)
 
         # Ensure user info is present
         if not __user__ or not __user__.get("id"):
@@ -2552,7 +2727,8 @@ Analyze the following related memories and provide a concise summary.""",
             log_exception(logger, error, level="warning")
             return body
         user_id = __user__["id"]
-        logger.info(f"Processing inlet for user_id: {user_id}")
+        log_with_context('info', "Starting inlet processing",
+                        component='INLET', user_id=user_id, operation='start')
 
         # -----------------------------------------------------------
         # Filter Orchestration System Integration
@@ -2582,10 +2758,13 @@ Analyze the following related memories and provide a concise summary.""",
                     COORDINATION_OVERHEAD.observe(coordination_overhead / 1000)
                     
                     if coordination_overhead > self.internal_config.coordination_overhead_threshold_ms:
-                        logger.warning(f"High coordination overhead detected: {coordination_overhead:.2f}ms")
+                        log_with_context('warning', f"High coordination overhead detected: {coordination_overhead:.2f}ms",
+                                       component='FILTER', user_id=user_id, operation='orchestration',
+                                       context={'overhead_ms': coordination_overhead})
                 
             except Exception as e:
-                logger.warning(f"Filter orchestration setup failed, continuing without coordination: {e}")
+                log_with_context('warning', "Filter orchestration setup failed, continuing without coordination",
+                               component='FILTER', user_id=user_id, operation='orchestration', error=e)
                 orchestration_context = None
 
         # --- Initialization & Valve Loading ---
@@ -2603,7 +2782,8 @@ Analyze the following related memories and provide a concise summary.""",
             # Respect per-user setting for status visibility, ensuring it's set after loading
             show_status = self.valves.show_memory_status and user_valves.show_status
         except Exception as e:
-            logger.error(f"Failed to load valves for user {user_id}: {e}")
+            log_with_context('error', "Failed to load valves",
+                           component='CONFIG', user_id=user_id, operation='load_valves', error=e)
             # Attempt to inform the UI, but ignore secondary errors to
             # avoid masking the original stack-trace
             try:
@@ -2628,9 +2808,11 @@ Analyze the following related memories and provide a concise summary.""",
 
         # --- Check for Guard Conditions ---
         if self._llm_feature_guard_active:
-            logger.warning("LLM feature guard active. Skipping LLM-dependent memory operations.")
+            log_with_context('info', "LLM feature guard active - skipping LLM-dependent memory operations",
+                           component='INLET', user_id=user_id, operation='feature_guard')
         if self._embedding_feature_guard_active:
-            logger.warning("Embedding feature guard active. Skipping embedding-dependent memory operations.")
+            log_with_context('info', "Embedding feature guard active - skipping embedding-dependent memory operations",
+                           component='INLET', user_id=user_id, operation='feature_guard')
 
 
         # --- Process Incoming Message ---
@@ -2655,7 +2837,8 @@ Analyze the following related memories and provide a concise summary.""",
 
             # --- /memory list_banks Command --- NEW
             if command == "/memory" and len(command_parts) >= 2 and command_parts[1].lower() == "list_banks":
-                logger.info(f"Handling command: /memory list_banks for user {user_id}")
+                log_with_context('info', "Handling /memory list_banks command",
+                               component='INLET', user_id=user_id, operation='command_list_banks')
                 try:
                     allowed_banks = self.valves.allowed_memory_banks
                     default_bank = self.valves.default_memory_bank
@@ -2677,7 +2860,7 @@ Analyze the following related memories and provide a concise summary.""",
                     body["bypass_prompt_processing"] = True # Signal to skip further processing
                     return body
                 except Exception as e:
-                    logger.error(f"Error handling /memory list_banks: {e}")
+                    log_with_context('error', f"Error handling /memory list_banks: {e}")
                     await self._safe_emit(__event_emitter__, {"type": "error", "content": "Failed to list memory banks."})
                     # Allow fall through maybe? Or block? Let's block.
                     body["messages"] = []
@@ -2687,7 +2870,8 @@ Analyze the following related memories and provide a concise summary.""",
 
             # --- /memory assign_bank Command --- NEW
             elif command == "/memory" and len(command_parts) >= 4 and command_parts[1].lower() == "assign_bank":
-                logger.info(f"Handling command: /memory assign_bank for user {user_id}")
+                log_with_context('info', "Handling /memory assign_bank command",
+                               component='INLET', user_id=user_id, operation='command_assign_bank')
                 try:
                     memory_id = command_parts[2]
                     target_bank = command_parts[3]
@@ -2741,7 +2925,7 @@ Analyze the following related memories and provide a concise summary.""",
                 except IndexError:
                      await self._safe_emit(__event_emitter__, {"type": "error", "content": "Usage: /memory assign_bank [memory_id] [bank_name]"})
                 except Exception as e:
-                    logger.error(f"Error handling /memory assign_bank: {e}\n{traceback.format_exc()}")
+                    log_with_context('error', f"Error handling /memory assign_bank: {e}\n{traceback.format_exc()}")
                     await self._safe_emit(__event_emitter__, {"type": "error", "content": f"Failed to assign memory bank: {e}"})
                     self._increment_error_counter("assign_bank_cmd_error")
 
@@ -2756,7 +2940,9 @@ Analyze the following related memories and provide a concise summary.""",
                 # Example: Check for /memory list, /memory forget, etc.
                 # Implement logic similar to assign_bank: parse args, call OWUI functions, emit status
                 # Remember to add command handlers here based on other implemented features
-                logger.info(f"Handling generic /memory command stub for user {user_id}: {final_message}")
+                log_with_context('info', f"Handling generic /memory command",
+                               component='INLET', user_id=user_id, operation='command_generic',
+                               context={'message': final_message})
                 await self._safe_emit(__event_emitter__, {"type": "info", "content": f"Memory command '{final_message}' received (implementation pending)."})
                 body["messages"] = []
                 body["prompt"] = "Memory command received." # Placeholder
@@ -2765,7 +2951,9 @@ Analyze the following related memories and provide a concise summary.""",
 
             # --- /note command (Placeholder/Example) ---
             elif command == "/note":
-                 logger.info(f"Handling /note command stub for user {user_id}: {final_message}")
+                 log_with_context('info', f"Handling /note command",
+                                component='INLET', user_id=user_id, operation='command_note',
+                                context={'message': final_message})
                  # Implement logic for Feature 6 (Scratchpad)
                  await self._safe_emit(__event_emitter__, {"type": "info", "content": f"Note command '{final_message}' received (implementation pending)."})
                  body["messages"] = []
@@ -2775,7 +2963,8 @@ Analyze the following related memories and provide a concise summary.""",
 
             # --- /diagnose command - LLM Connection Diagnostics ---
             elif command == "/diagnose":
-                logger.info(f"Handling /diagnose command for user {user_id}")
+                log_with_context('info', "Handling /diagnose command",
+                               component='INLET', user_id=user_id, operation='command_diagnose')
                 
                 await self._safe_emit(__event_emitter__, {
                     "type": "status", 
@@ -2882,7 +3071,7 @@ Analyze the following related memories and provide a concise summary.""",
                     return body
                     
                 except Exception as diag_error:
-                    logger.error(f"Diagnostic command failed: {diag_error}")
+                    log_with_context('error', f"Diagnostic command failed: {diag_error}")
                     await self._safe_emit(__event_emitter__, {
                         "type": "status", 
                         "data": {
@@ -2903,7 +3092,8 @@ Analyze the following related memories and provide a concise summary.""",
 
             # --- /reset command - Reset Circuit Breakers ---
             elif command == "/reset":
-                logger.info(f"Handling /reset command for user {user_id}")
+                log_with_context('info', "Handling /reset command",
+                               component='INLET', user_id=user_id, operation='command_reset')
                 
                 try:
                     # Check if specific endpoint is requested
@@ -2946,7 +3136,7 @@ Analyze the following related memories and provide a concise summary.""",
                         return body
                         
                 except Exception as reset_error:
-                    logger.error(f"Reset command failed: {reset_error}")
+                    log_with_context('error', f"Reset command failed: {reset_error}")
                     error_report = f"🔴 **Reset Error**\n\nFailed to reset: {str(reset_error)}"
                     
                     body["messages"] = [{
@@ -2960,14 +3150,16 @@ Analyze the following related memories and provide a concise summary.""",
         # --- Memory Injection --- #
         if self.valves.show_memories and not self._embedding_feature_guard_active: # Guard embedding-dependent retrieval
             try:
-                logger.info(f"Retrieving relevant memories for user {user_id}, message: '{(final_message or '')[:50]}...'")
+                log_with_context('info', f"Retrieving relevant memories, message: '{(final_message or '')[:50]}...'",
+                               component='INLET', user_id=user_id, operation='get_relevant')
                 # Use user-specific timezone for relevance calculation context
                 relevant_memories = await self.get_relevant_memories(
                     current_message=final_message if final_message else "",
                     user_id=user_id,
                     user_timezone=user_valves.timezone # Use user-specific timezone
                 )
-                logger.info(f"Retrieved {len(relevant_memories) if relevant_memories else 0} relevant memories for injection")
+                log_with_context('info', f"Retrieved {len(relevant_memories) if relevant_memories else 0} relevant memories for injection",
+                               component='INLET', user_id=user_id, operation='inject_memories')
                 if relevant_memories:
                     logger.info(
                         f"Injecting {len(relevant_memories)} relevant memories for user {user_id}"
@@ -2984,13 +3176,16 @@ Analyze the following related memories and provide a concise summary.""",
                                 },
                             },
                     )
-                    self._inject_memories_into_context(body, relevant_memories)
+                    injected_count = self._inject_memories_into_context(body, relevant_memories)
+                    log_with_context('info', f"Memory injection completed: {injected_count} memories injected",
+                                   component='OUTLET', user_id=user_id, operation='injection_complete',
+                                   context={'injected': injected_count})
                 else:
-                    logger.info(f"No relevant memories found for user {user_id} - checking if this is expected")
+                    log_with_context('debug', "No relevant memories found - checking if expected",
+                                   component='OUTLET', user_id=user_id, operation='inject_memories')
             except Exception as e:
-                logger.error(
-                    f"Error retrieving/injecting memories: {e}\n{traceback.format_exc()}"
-                )
+                log_with_context('error', "Error retrieving/injecting memories",
+                               component='OUTLET', user_id=user_id, operation='injection_error', error=e)
                 await self._safe_emit(
                     __event_emitter__,
                     {"type": "error", "content": "Error retrieving relevant memories."},
@@ -3023,7 +3218,8 @@ Analyze the following related memories and provide a concise summary.""",
                 timeout=120.0  # 2 minutes max for outlet processing
             )
         except asyncio.TimeoutError:
-            logger.error("async_outlet operation timed out after 120 seconds")
+            log_with_context('error', "Outlet operation timed out after 120 seconds",
+                           component='OUTLET', operation='timeout')
             await self._safe_emit(__event_emitter__, {
                 "type": "status",
                 "data": {
@@ -3033,7 +3229,8 @@ Analyze the following related memories and provide a concise summary.""",
             })
             return body
         except Exception as e:
-            logger.error(f"Critical error in async_outlet: {e}")
+            log_with_context('error', "Critical error in outlet processing",
+                           component='OUTLET', operation='error', error=e)
             await self._safe_emit(__event_emitter__, {
                 "type": "status",
                 "data": {
@@ -3064,10 +3261,12 @@ Analyze the following related memories and provide a concise summary.""",
         orchestration_context = None
         operation_start_time = time.time()
         
+        # Get user_id early for logging
+        user_id = str(__user__.get("id", "unknown")) if __user__ else "unknown"
+        
         if self.internal_config.enable_filter_orchestration:
             try:
                 # Create execution context for this operation
-                user_id = __user__.get("id") if __user__ else None
                 orchestration_context = self._create_execution_context(user_id)
                 
                 # Record operation start
@@ -3081,7 +3280,8 @@ Analyze the following related memories and provide a concise summary.""",
                 })
                 
             except Exception as e:
-                logger.warning(f"Filter orchestration setup failed in outlet, continuing without coordination: {e}")
+                log_with_context('warning', "Filter orchestration setup failed in outlet, continuing without coordination",
+                               component='OUTLET', user_id=user_id, operation='orchestration', error=e)
                 orchestration_context = None
 
         # Ensure configuration persistence at start of operation (with timeout)
@@ -3091,29 +3291,36 @@ Analyze the following related memories and provide a concise summary.""",
                 timeout=5.0
             )
             if not config_check:
-                logger.warning("Configuration persistence check failed in async_outlet, but continuing with current config")
+                log_with_context('warning', "Configuration persistence check failed, continuing with current config",
+                               component='OUTLET', user_id=user_id, operation='config_check')
         except asyncio.TimeoutError:
-            logger.warning("Configuration persistence check timed out in async_outlet, continuing with current config")
+            log_with_context('warning', "Configuration persistence check timed out, continuing with current config",
+                           component='OUTLET', user_id=user_id, operation='config_check')
         except Exception as e:
-            logger.warning(f"Configuration persistence check error in async_outlet: {e}, continuing with current config")
+            log_with_context('warning', "Configuration persistence check error, continuing with current config",
+                           component='OUTLET', user_id=user_id, operation='config_check', error=e)
 
         # Skip processing if user is not authenticated
         if not __user__:
-            logger.warning("No user information available - skipping memory processing")
+            log_with_context('warning', "No user information available - skipping memory processing",
+                           component='OUTLET', user_id='unknown', operation='validate_user')
             return body_copy
 
         # Get user's ID for memory storage
         user_id = __user__.get("id")
         if not user_id:
-            logger.warning("User object contains no ID - skipping memory processing")
+            log_with_context('warning', "User object contains no ID - skipping memory processing",
+                           component='OUTLET', user_id='unknown', operation='validate_user')
             return body_copy
         
-        logger.info(f"Processing outlet for user_id: {user_id}")
+        log_with_context('info', "Starting outlet processing",
+                        component='OUTLET', user_id=user_id, operation='start')
 
         # Check if user has enabled memory function
         user_valves = self._get_user_valves(__user__)
         if not user_valves.enabled:
-            logger.info(f"Memory function is disabled for user {user_id}")
+            log_with_context('info', "Memory function is disabled",
+                           component='OUTLET', user_id=user_id, operation='check_enabled')
             return body_copy
 
         # Get user's timezone if set
@@ -3161,9 +3368,10 @@ Analyze the following related memories and provide a concise summary.""",
                         conversation_to_process += f"\n\nAssistant: {assistant_response_content}"
 
             if conversation_to_process:
-                logger.info(f"Starting memory processing in outlet for conversation")
-                logger.debug(f"Processing user message: {last_user_message_content[:60] if last_user_message_content else 'None'}...")
-                logger.debug(f"Processing assistant response: {assistant_response_content[:60] if assistant_response_content else 'None'}...")
+                log_with_context('info', "Starting memory processing for conversation",
+                               component='OUTLET', user_id=user_id, operation='memory_start')
+                log_with_context('debug', f"Processing user message: {last_user_message_content[:60] if last_user_message_content else 'None'}...")
+                log_with_context('debug', f"Processing assistant response: {assistant_response_content[:60] if assistant_response_content else 'None'}...")
                 
                 # Show status message if enabled
                 if user_valves.show_status and __event_emitter__:
@@ -3196,7 +3404,8 @@ Analyze the following related memories and provide a concise summary.""",
                     # Wait for the task to complete with a reasonable timeout
                     try:
                         await asyncio.wait_for(memory_task, timeout=30.0)
-                        logger.info(f"Memory processing completed successfully")
+                        log_with_context('info', "Memory processing completed successfully",
+                                       component='OUTLET', user_id=user_id, operation='memory_complete')
                         
                         # Show completion status
                         if user_valves.show_status and __event_emitter__:
@@ -3233,7 +3442,7 @@ Analyze the following related memories and provide a concise summary.""",
                             logger.warning(f"Memory processing failed, attempting rollback: {memory_error}")
                             self._perform_rollback()
                     
-                    logger.error(f"Memory processing failed: {memory_error}")
+                    log_with_context('error', f"Memory processing failed: {memory_error}")
                     
                     if user_valves.show_status and __event_emitter__:
                         await self._safe_emit(
@@ -3266,7 +3475,8 @@ Analyze the following related memories and provide a concise summary.""",
             if user_valves.show_status:
                 await self._add_confirmation_message(body_copy)
         except Exception as e:
-            logger.error(f"Error adding confirmation message: {e}")
+            log_with_context('error', "Error adding confirmation message",
+                           component='OUTLET', operation='confirmation_error', error=e)
 
         # -----------------------------------------------------------
         # Filter Orchestration Completion Tracking
@@ -3283,7 +3493,7 @@ Analyze the following related memories and provide a concise summary.""",
                     orchestration_context.shared_state["adaptive_memory_user_id"] = user_id
                     
             except Exception as e:
-                logger.debug(f"Failed to record orchestration completion: {e}")
+                log_with_context('debug', f"Failed to record orchestration completion: {e}")
 
         # Clean the body before returning - remove user object if present
         # OpenWebUI expects 'user' to be a string (user ID) not an object when sending to LLM
@@ -3301,34 +3511,42 @@ Analyze the following related memories and provide a concise summary.""",
 
     async def _safe_emit(self, event_emitter: Optional[Callable[[Any], Awaitable[None]]], data: Dict[str, Any]) -> None:
         if not event_emitter:
-            logger.debug("Event emitter not available")
+            log_with_context('debug', "Event emitter not available")
             return
         try:
             await event_emitter(data)
         except Exception as e:
-            logger.error(f"Error in event emitter: {e}")
+            log_with_context('error', "Error in event emitter",
+                           component='OUTLET', operation='emitter_error', error=e)
 
     def _get_user_valves(self, __user__: dict) -> UserValves:
         if not __user__:
-            logger.warning("No user information provided")
+            log_with_context('warning', "No user information provided",
+                           component='CONFIG', operation='get_user_valves')
             return self.UserValves()
+        
+        user_id = __user__.get('id', 'unknown') if hasattr(__user__, 'get') else 'unknown'
         user_valves_data = getattr(__user__, "valves", {})
+        
         if not isinstance(user_valves_data, dict):
-            logger.warning(f"User valves attribute is not a dictionary (type: {type(user_valves_data)}), using defaults.")
+            log_with_context('warning', f"User valves attribute is not a dictionary (type: {type(user_valves_data)}), using defaults",
+                           component='CONFIG', user_id=user_id, operation='get_user_valves')
             user_valves_data = {}
         try:
             return self.UserValves(**user_valves_data)
         except Exception as e:
-            logger.error(f"Could not determine user valves settings from data {user_valves_data}: {e}")
+            log_with_context('error', f"Could not determine user valves settings from data: {user_valves_data}",
+                           component='CONFIG', user_id=user_id, operation='get_user_valves', error=e)
             return self.UserValves()
 
     async def _get_formatted_memories(self, user_id: str) -> List[Dict[str, Any]]:
         if not user_id:
-            logger.error("_get_formatted_memories called without user_id")
+            log_with_context('error', "_get_formatted_memories called without user_id",
+                           component='MEMORY', operation='get_formatted_memories')
             raise ValueError("user_id is required for fetching memories")
         memories_list = []
         try:
-            logger.debug(f"Fetching memories for user_id: {user_id}")
+            log_with_context('debug', f"Fetching memories for user_id: {user_id}")
             user_memories = Memories.get_memories_by_user_id(user_id=str(user_id))
             if user_memories:
                 for memory in user_memories:
@@ -3342,15 +3560,17 @@ Analyze the following related memories and provide a concise summary.""",
                         "created_at": created_at,
                         "updated_at": updated_at,
                     })
-            logger.debug(f"Retrieved {len(memories_list)} memories for user {user_id}")
+            log_with_context('debug', f"Retrieved {len(memories_list)} memories for user {user_id}")
             return memories_list
         except Exception as e:
-            logger.error(f"Error getting formatted memories: {e}\n{traceback.format_exc()}")
+            log_with_context('error', "Error getting formatted memories",
+                           component='MEMORY', user_id=user_id, operation='get_formatted_memories', error=e)
             return []
 
-    def _inject_memories_into_context(self, body: Dict[str, Any], memories: List[Dict[str, Any]]) -> None:
+    def _inject_memories_into_context(self, body: Dict[str, Any], memories: List[Dict[str, Any]]) -> int:
+        """Inject memories into context and return count of injected memories"""
         if not memories:
-            return
+            return 0
         sorted_memories = sorted(memories, key=lambda x: x.get("relevance", 0), reverse=True)
         memory_context = self._format_memories_for_context(sorted_memories, self.valves.memory_format)
         instruction = (
@@ -3364,7 +3584,7 @@ Analyze the following related memories and provide a concise summary.""",
             "Only answer the user's question directly.\n\n"
         )
         memory_context = instruction + memory_context
-        logger.debug(f"Injected memories:\n{memory_context[:500]}...")
+        log_with_context('debug', f"Injected memories:\n{memory_context[:500]}...")
         if "messages" in body:
             system_message_exists = False
             for message in body["messages"]:
@@ -3378,6 +3598,8 @@ Analyze the following related memories and provide a concise summary.""",
                 # Apply database write hooks to memory context before injection
                 processed_memory_context = self._prepare_content_for_database(memory_context, "memory_injection")
                 body["messages"].insert(0, {"role": "system", "content": processed_memory_context})
+        
+        return len(memories)
 
     def _format_memories_for_context(self, memories: List[Dict[str, Any]], format_type: str) -> str:
         if not memories:
@@ -3401,12 +3623,15 @@ Analyze the following related memories and provide a concise summary.""",
                                     show_status: bool = True, user_timezone: Optional[str] = None,
                                     recent_chat_history: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         if not user_id:
-            logger.error("_process_user_memories called without user_id")
+            log_with_context('error', "_process_user_memories called without user_id",
+                           component='MEMORY', operation='process_memories')
             raise ValueError("user_id is required for memory processing")
         if not self._ensure_configuration_persistence():
-            logger.warning("Configuration persistence check failed in _process_user_memories, but continuing with current config")
+            log_with_context('warning', "Configuration persistence check failed, continuing with current config",
+                           component='MEMORY', user_id=user_id, operation='config_check')
         config_content = getattr(self, "config", "<Not Set>")
-        logger.info(f"Inspecting self.config at start of _process_user_memories for user {user_id}: {config_content}") 
+        log_with_context('debug', f"Inspecting config at start of _process_user_memories: {config_content}",
+                        component='MEMORY', user_id=user_id, operation='inspect_config') 
 
         # Start timer
         start_time = time.perf_counter()
@@ -3430,7 +3655,7 @@ Analyze the following related memories and provide a concise summary.""",
             )
 
         # Debug logging for function entry
-        logger.debug(
+        log_with_context('debug', 
             f"Starting _process_user_memories for user {user_id} with message: {user_message[:50]}..."
         )
 
@@ -3441,12 +3666,13 @@ Analyze the following related memories and provide a concise summary.""",
             user_valves = self._get_user_valves(user)
 
             # Debug logging for user valves
-            logger.debug(
+            log_with_context('debug', 
                 f"Retrieved user valves with memory enabled: {user_valves.enabled}"
             )
 
             if not user_valves.enabled:
-                logger.info(f"Memory function disabled for user: {user_id}")
+                log_with_context('info', "Memory function disabled",
+                               component='MEMORY', user_id=user_id, operation='check_enabled')
                 if show_status:
                     await self._safe_emit(
                         event_emitter,
@@ -3460,7 +3686,8 @@ Analyze the following related memories and provide a concise summary.""",
                     )
                 return []
         except Exception as e:
-            logger.error(f"Error getting user valves: {e}")
+            log_with_context('error', "Error getting user valves",
+                           component='MEMORY', user_id=user_id, operation='get_user_valves', error=e)
             if show_status:
                 await self._safe_emit(
                     event_emitter,
@@ -3475,7 +3702,7 @@ Analyze the following related memories and provide a concise summary.""",
             return []
 
         # Debug logging for memory identification start
-        logger.debug(f"Starting memory identification for message: {user_message[:60]}...")
+        log_with_context('debug', f"Starting memory identification for message: {user_message[:60]}...")
 
         # Step 1: Use LLM to identify memories in the message
         memories = []
@@ -3486,11 +3713,12 @@ Analyze the following related memories and provide a concise summary.""",
             # If the LLM needs context of existing memories:
             try:
                 existing_memories = await self._get_formatted_memories(user_id)
-                logger.debug(
+                log_with_context('debug', 
                     f"Retrieved {len(existing_memories)} existing memories for context"
                 )
             except Exception as e:
-                logger.warning(f"Could not get existing memories (continuing): {e}")
+                log_with_context('warning', "Could not get existing memories (continuing)",
+                               component='MEMORY', user_id=user_id, operation='get_existing', error=e)
 
             # Process message to extract memory operations
             memories = await self.identify_memories(
@@ -3500,15 +3728,28 @@ Analyze the following related memories and provide a concise summary.""",
             )
 
             # Debug logging after memory identification
-            logger.debug(
+            log_with_context('debug', 
                 f"Memory identification complete. Found {len(memories)} potential memories"
             )
 
         except Exception as e:
             self.error_counters["llm_call_errors"] += 1
-            logger.error(f"Error identifying memories: {e}\n{traceback.format_exc()}")
+            log_with_context('error', "Error identifying memories",
+                           component='MEMORY', user_id=user_id, operation='identify_memories', error=e)
             self._error_message = f"llm_error: {str(e)[:50]}..." # Point 6: More specific error
-            parse_error_occurred = True # Indicate identification failed\n            \n            # Try fallback memory creation for preference statements\n            if getattr(self.valves, 'enable_hang_prevention', True):\n                logger.info(\"Attempting fallback memory creation for preference statements\")\n                fallback_memories = await self._create_fallback_memory_from_preference(user_message)\n                if fallback_memories:\n                    logger.info(f\"Created {len(fallback_memories)} fallback memories\")\n                    memories = fallback_memories\n                    parse_error_occurred = False
+            parse_error_occurred = True  # Indicate identification failed
+            
+            # Try fallback memory creation for preference statements
+            if getattr(self.valves, 'enable_hang_prevention', True):
+                log_with_context('info', "Attempting fallback memory creation for preference statements",
+                               component='MEMORY', user_id=user_id, operation='fallback_create')
+                fallback_memories = await self._create_fallback_memory_from_preference(user_message)
+                if fallback_memories:
+                    log_with_context('info', f"Created {len(fallback_memories)} fallback memories",
+                                   component='MEMORY', user_id=user_id, operation='fallback_success',
+                                   context={'count': len(fallback_memories)})
+                    memories = fallback_memories
+                    parse_error_occurred = False
             if show_status:
                 await self._safe_emit(
                     event_emitter,
@@ -3523,7 +3764,7 @@ Analyze the following related memories and provide a concise summary.""",
             return []
 
         # Debug logging for filtering
-        logger.debug("Starting memory filtering step...")
+        log_with_context('debug', "Starting memory filtering step...")
 
         # Step 2: Filter memories (apply blacklist/whitelist/trivia filtering)
         filtered_memories = []
@@ -3536,7 +3777,7 @@ Analyze the following related memories and provide a concise summary.""",
                 whitelist = self.valves.whitelist_keywords
                 filter_trivia = self.valves.filter_trivia
 
-                logger.debug(
+                log_with_context('debug', 
                     f"Using filters: min_length={min_length}, blacklist={blacklist}, whitelist={whitelist}, filter_trivia={filter_trivia}"
                 )
 
@@ -3565,7 +3806,7 @@ Analyze the following related memories and provide a concise summary.""",
                 for memory in memories:
                     # Validate operation
                     if not self._validate_memory_operation(memory):
-                        logger.debug(f"Invalid memory operation: {str(memory)}")
+                        log_with_context('debug', f"Invalid memory operation: {str(memory)}")
                         continue
 
                     # Extract content for filtering
@@ -3573,7 +3814,7 @@ Analyze the following related memories and provide a concise summary.""",
 
                     # Apply minimum length filter
                     if len(content) < min_length:
-                        logger.debug(
+                        log_with_context('debug', 
                             f"Memory too short ({len(content)} < {min_length}): {content}"
                         )
                         continue
@@ -3583,7 +3824,7 @@ Analyze the following related memories and provide a concise summary.""",
                     for phrase in meta_request_phrases:
                         if phrase.lower() in content.lower():
                             is_meta_request = True
-                            logger.debug(f"Meta-request detected: {content}")
+                            log_with_context('debug', f"Meta-request detected: {content}")
                             break
 
                     if is_meta_request:
@@ -3602,14 +3843,14 @@ Analyze the following related memories and provide a concise summary.""",
                                         keyword = keyword.strip().lower()
                                         if keyword and keyword in content.lower():
                                             is_whitelisted = True
-                                            logger.debug(
+                                            log_with_context('debug', 
                                                 f"Whitelisted term '{keyword}' found in blacklisted content"
                                             )
                                             break
 
                                 if not is_whitelisted:
                                     is_blacklisted = True
-                                    logger.debug(
+                                    log_with_context('debug', 
                                         f"Blacklisted topic '{topic}' found: {content}"
                                     )
                                     break
@@ -3622,7 +3863,7 @@ Analyze the following related memories and provide a concise summary.""",
                         is_trivia = False
                         for pattern in trivia_patterns:
                             if re.search(pattern, content.lower()):
-                                logger.debug(
+                                log_with_context('debug', 
                                     f"Trivia pattern '{pattern}' matched: {content}"
                                 )
                                 is_trivia = True
@@ -3633,13 +3874,13 @@ Analyze the following related memories and provide a concise summary.""",
 
                     # Memory passed all filters
                     filtered_memories.append(memory)
-                    logger.debug(f"Memory passed all filters: {content}")
+                    log_with_context('debug', f"Memory passed all filters: {content}")
 
                 logger.info(
                     f"Filtered memories: {len(filtered_memories)}/{len(memories)} passed"
                 )
             except Exception as e:
-                logger.error(f"Error filtering memories: {e}\n{traceback.format_exc()}")
+                log_with_context('error', f"Error filtering memories: {e}\n{traceback.format_exc()}")
                 filtered_memories = (
                     memories  # On error, attempt to process all memories
                 )
@@ -3648,14 +3889,14 @@ Analyze the following related memories and provide a concise summary.""",
         memories_passing_confidence = []
         low_confidence_discarded = 0
         min_conf = self.valves.min_confidence_threshold
-        logger.debug(f"Applying confidence filter (threshold: {min_conf})...")
+        log_with_context('debug', f"Applying confidence filter (threshold: {min_conf})...")
         for mem in filtered_memories:
             confidence_score = float(mem.get("confidence", 0.0)) # Ensure float comparison
             if confidence_score >= min_conf:
                 memories_passing_confidence.append(mem)
             else:
                 low_confidence_discarded += 1
-                logger.debug(f"Discarding memory due to low confidence ({confidence_score:.2f} < {min_conf}): {str(mem.get('content', ''))[:50]}...")
+                log_with_context('debug', f"Discarding memory due to low confidence ({confidence_score:.2f} < {min_conf}): {str(mem.get('content', ''))[:50]}...")
         
         # Emit status message if any memories were discarded due to low confidence
         if low_confidence_discarded > 0 and show_status:
@@ -3675,7 +3916,7 @@ Analyze the following related memories and provide a concise summary.""",
         # --- END NEW ---
 
         # Debug logging after filtering
-        logger.debug(f"After filtering: {len(filtered_memories)} memories remain")
+        log_with_context('debug', f"After filtering: {len(filtered_memories)} memories remain")
 
         # If no memories to process after filtering, log and return
         if not filtered_memories: # Check if the list is empty
@@ -3716,7 +3957,7 @@ Analyze the following related memories and provide a concise summary.""",
                     saved_operations_list = [shortcut_op.model_dump()] # Use model_dump() for Pydantic v2+
                     # Skip the rest of the processing steps as we forced a save
                 except Exception as shortcut_err:
-                    logger.error(f"Error during short preference shortcut save: {shortcut_err}")
+                    log_with_context('error', f"Error during short preference shortcut save: {shortcut_err}")
                     self._error_message = "shortcut_save_error"
                     saved_operations_list = [] # Indicate save failed
             else:
@@ -3744,7 +3985,7 @@ Analyze the following related memories and provide a concise summary.""",
         # Step 3: Get current memories and handle max_total_memories limit
         try:
             current_memories_data = await self._get_formatted_memories(user_id)
-            logger.debug(
+            log_with_context('debug', 
                 f"Retrieved {len(current_memories_data)} existing memories from database"
             )
 
@@ -3755,9 +3996,9 @@ Analyze the following related memories and provide a concise summary.""",
             
             if current_count + new_count > max_memories:
                 to_remove = current_count + new_count - max_memories
-                logger.info(
-                    f"Memory limit ({max_memories}) would be exceeded. Need to prune {to_remove} memories."
-                )
+                log_with_context('info', f"Memory limit would be exceeded. Need to prune {to_remove} memories",
+                               component='MEMORY', user_id=user_id, operation='memory_limit_exceeded',
+                               context={'limit': max_memories, 'to_remove': to_remove})
                 
                 memories_to_prune_ids = []
                 
@@ -3838,7 +4079,7 @@ Rate the relevance of EACH memory to the current user message."""
                                     # Fallback: assign 0 relevance to all, effectively making it FIFO-like for this run
                                     memories_with_relevance = [{"id": m["id"], "relevance": 0.0} for m in current_memories_data]
                             except Exception as llm_err:
-                                logger.error(f"Error during LLM relevance check for pruning: {llm_err}")
+                                log_with_context('error', f"Error during LLM relevance check for pruning: {llm_err}")
                                 memories_with_relevance = [{"id": m["id"], "relevance": 0.0} for m in current_memories_data]
                         else: # Cannot use vectors and LLM not enabled - default to FIFO-like
                              logger.warning("Cannot determine relevance for pruning (no embeddings/LLM). Pruning will be FIFO-like.")
@@ -3850,10 +4091,11 @@ Rate the relevance of EACH memory to the current user message."""
                         
                         # Select the IDs of the least relevant memories to remove (take the first `to_remove` items after sorting)
                         memories_to_prune_ids = [mem["id"] for mem in memories_with_relevance[:to_remove]]
-                        logger.info(f"Identified {len(memories_to_prune_ids)} least relevant memories for pruning.")
+                        log_with_context('info', f"Identified {len(memories_to_prune_ids)} least relevant memories for pruning",
+                                       component='MEMORY', user_id=user_id, operation='pruning_identified')
                         
                     except Exception as relevance_err:
-                        logger.error(f"Error calculating relevance for pruning, falling back to FIFO: {relevance_err}")
+                        log_with_context('error', f"Error calculating relevance for pruning, falling back to FIFO: {relevance_err}")
                         # Fallback to FIFO on any error during relevance calculation
                         strategy = "fifo"
                         
@@ -3867,7 +4109,8 @@ Rate the relevance of EACH memory to the current user message."""
                         key=lambda x: x.get("created_at", default_date)
                     )
                     memories_to_prune_ids = [mem["id"] for mem in sorted_memories[:to_remove]]
-                    logger.info(f"Identified {len(memories_to_prune_ids)} oldest memories (FIFO) for pruning.")
+                    log_with_context('info', f"Identified {len(memories_to_prune_ids)} oldest memories (FIFO) for pruning",
+                                   component='MEMORY', user_id=user_id, operation='pruning_fifo')
 
                 # Execute pruning if IDs were identified
                 if memories_to_prune_ids:
@@ -3878,8 +4121,9 @@ Rate the relevance of EACH memory to the current user message."""
                             await self._execute_memory_operation(delete_op, user)
                             pruned_count += 1
                         except Exception as e:
-                            logger.error(f"Error pruning memory {memory_id_to_delete}: {e}")
-                    logger.info(f"Successfully pruned {pruned_count} memories.")
+                            log_with_context('error', f"Error pruning memory {memory_id_to_delete}: {e}")
+                    log_with_context('info', f"Successfully pruned {pruned_count} memories",
+                                   component='MEMORY', user_id=user_id, operation='pruning_complete')
                 else:
                     logger.warning("Pruning needed but no memory IDs identified for deletion.")
                     
@@ -3890,37 +4134,36 @@ Rate the relevance of EACH memory to the current user message."""
             # Continue processing the new memories even if pruning failed
 
         # Debug logging before processing operations
-        logger.debug("Beginning to process memory operations...")
+        log_with_context('debug', "Beginning to process memory operations...")
 
         # Step 4: Process the filtered memories
         processing_error: Optional[Exception] = None
         try:
             # process_memories now returns the list of successfully executed operations
-            logger.debug(f"Calling process_memories with {len(filtered_memories)} items: {str(filtered_memories)}") # Log the exact list being passed
+            log_with_context('debug', f"Calling process_memories with {len(filtered_memories)} items: {str(filtered_memories)}") # Log the exact list being passed
             saved_operations_list = await self.process_memories(
                 filtered_memories, user_id
             )
-            logger.debug(
-                f"Memory saving attempt complete, returned {len(saved_operations_list)} successfully saved operations."
-            )
+            log_with_context('debug', f"Memory saving attempt complete: {len(saved_operations_list)} operations saved",
+                           component='MEMORY', user_id=user_id, operation='save_complete',
+                           context={'saved_count': len(saved_operations_list)})
         except Exception as e:
             processing_error = e
-            logger.error(f"Error processing memories: {e}\n{traceback.format_exc()}")
-            self._error_message = f"processing_error: {str(e)[:50]}..." # Point 6: More specific error
+            log_with_context('error', "Error processing memories",
+                           component='MEMORY', user_id=user_id, operation='process_error', error=e)
+            self._error_message = f"processing_error: {str(e)[:50]}..."  # Point 6: More specific error
 
         # Debug confirmation logs
         if saved_operations_list:
-            logger.info(
-                f"Successfully processed and saved {len(saved_operations_list)} memories"
-            )
+            log_with_context('info', f"Memory extraction completed: {len(saved_operations_list)} memories saved",
+                           component='MEMORY', user_id=user_id, operation='extraction_complete',
+                           context={'saved_count': len(saved_operations_list)})
         elif processing_error:
-            logger.warning(
-                f"Memory processing failed due to an error: {processing_error}"
-            )
+            log_with_context('warning', f"Memory processing failed due to an error: {processing_error}",
+                           component='MEMORY', user_id=user_id, operation='process_failed')
         else:
-            logger.warning(
-                "Memory processing finished, but no memories were saved (potentially due to duplicates or errors during save).)"
-            )
+            log_with_context('warning', "Memory processing finished, but no memories were saved (potentially due to duplicates or errors)",
+                           component='MEMORY', user_id=user_id, operation='process_no_saves')
 
         # Emit completion status
         if show_status:
@@ -3964,7 +4207,7 @@ Rate the relevance of EACH memory to the current user message."""
         user_timezone: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Identify potential memories from text using LLM"""
-        logger.debug(
+        log_with_context('debug', 
             f"Starting memory identification from input text: {input_text[:50]}..."
         )
 
@@ -3973,7 +4216,7 @@ Rate the relevance of EACH memory to the current user message."""
 
         # Clean up and prepare the input
         clean_input = input_text.strip()
-        logger.debug(f"Cleaned input text length: {len(clean_input)}")
+        log_with_context('debug', f"Cleaned input text length: {len(clean_input)}")
 
         # Prepare the system prompt
         try:
@@ -4014,12 +4257,12 @@ Rate the relevance of EACH memory to the current user message."""
             context = f"{datetime_context}\nEnabled categories: {categories_str}\n{existing_memories_str}"
 
             # Log the components of the prompt
-            logger.debug(f"Memory identification context: {context}")
+            log_with_context('debug', f"Memory identification context: {context}")
 
             # Create the final system prompt with context
             system_prompt = f"{memory_prompt}\n\nCONTEXT:\n{context}"
 
-            logger.debug(
+            log_with_context('debug', 
                 f"Final memory identification system prompt length: {len(system_prompt)}"
             )
         except Exception as e:
@@ -4028,7 +4271,7 @@ Rate the relevance of EACH memory to the current user message."""
 
         # Call LLM to identify memories
         start_time = time.time()
-        logger.debug(
+        log_with_context('debug', 
             f"Calling LLM for memory identification with provider: {self.valves.llm_provider}, model: {self.valves.llm_model_name}"
         )
 
@@ -4055,7 +4298,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             # Note: Doubled curly braces {{ }} are used to escape them within the f-string for the JSON examples.
 
             # Log the user prompt structure for debugging
-            logger.debug(
+            log_with_context('debug', 
                 f"User prompt structure with few-shot examples:\n{user_prompt[:500]}..."
             )  # Log first 500 chars
 
@@ -4064,35 +4307,34 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                 system_prompt, user_prompt
             )  # Pass the new user_prompt
             elapsed = time.time() - start_time
-            logger.debug(
+            log_with_context('debug', 
                 f"LLM memory identification completed in {elapsed:.2f}s, response length: {len(llm_response)}"
             )
-            logger.debug(f"LLM raw response for memory identification: {llm_response}")
+            log_with_context('debug', f"LLM raw response for memory identification: {llm_response}")
 
             # --- Handle LLM Errors --- #
             if llm_response.startswith("Error:"):
                 self.error_counters["llm_call_errors"] += 1
                 if "LLM_CONNECTION_FAILED" in llm_response:
-                    logger.error(f"LLM Connection Error during identification: {llm_response}")
+                    log_with_context('error', f"LLM Connection Error during identification: {llm_response}")
                     self._error_message = "llm_connection_error"
                 else:
-                    logger.error(f"LLM Error during identification: {llm_response}")
+                    log_with_context('error', f"LLM Error during identification: {llm_response}")
                     self._error_message = "llm_error"
                 return [] # Return empty list on LLM error
 
             # Parse the response (assumes JSON format)
             result = self._extract_and_parse_json(llm_response)
-            logger.debug(
+            log_with_context('debug', 
                 f"Parsed result type: {type(result)}, content: {str(result)[:500]}"
             )
 
             # Check if we got a dict instead of a list (common LLM error)
             if isinstance(result, dict):
-                logger.warning(
-                    "LLM returned a JSON object instead of an array. Attempting conversion."
-                )
+                log_with_context('warning', "LLM returned a JSON object instead of an array. Attempting conversion.",
+                               component='LLM', operation='parse_response')
                 result = self._convert_dict_to_memory_operations(result)
-                logger.debug(f"Converted dict to {len(result)} memory operations")
+                log_with_context('debug', f"Converted dict to {len(result)} memory operations")
 
             # Check for empty result
             if not result:
@@ -4110,12 +4352,12 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                     else:
                         invalid_count += 1
 
-                logger.debug(
+                log_with_context('debug', 
                     f"Identified {len(valid_operations)} valid memory operations, {invalid_count} invalid"
                 )
                 return valid_operations
             else:
-                logger.error(
+                log_with_context('error', 
                     f"LLM returned invalid format (neither list nor dict): {type(result)}"
                 )
                 self._error_message = (
@@ -4179,11 +4421,15 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             return False
 
         if op["operation"] in ["UPDATE", "DELETE"] and "id" not in op:
-            logger.warning(f"Missing ID for {op['operation']} operation: {op}")
+            log_with_context('warning', f"Missing ID for {op['operation']} operation",
+                           component='MEMORY', operation='validate_operation',
+                           context={'op': op})
             return False
 
         if op["operation"] in ["NEW", "UPDATE"] and "content" not in op:
-            logger.warning(f"Missing content for {op['operation']} operation: {op}")
+            log_with_context('warning', f"Missing content for {op['operation']} operation",
+                           component='MEMORY', operation='validate_operation',
+                           context={'op': op})
             return False
 
         # Tags are optional but should be a list if present
@@ -4232,7 +4478,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                 op["memory_bank"] = self.valves.default_memory_bank
         else:
             # If memory_bank is missing or not a string, set default
-            logger.debug(
+            log_with_context('debug', 
                 f"Memory bank missing or invalid type ({type(op.get('memory_bank'))}), using default '{self.valves.default_memory_bank}'"
             )
             op["memory_bank"] = self.valves.default_memory_bank
@@ -4246,7 +4492,8 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                 logger.warning(f"Invalid confidence score type: {type(op['confidence'])}")
                 return False
         else:
-            logger.warning("Missing confidence score")
+            log_with_context('warning', "Missing confidence score in operation",
+                           component='MEMORY', operation='validate_confidence')
             return False
         return True
 
@@ -4260,7 +4507,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
         if not text:
             return None
 
-        logger.debug(f"Raw LLM response content received: {text[:200]}...")
+        log_with_context('debug', f"Raw LLM response content received: {text[:200]}...")
         
         # Use enhanced JSON parser if available
         if self._json_parser is not None:
@@ -4274,7 +4521,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                 result = self._json_parser.parse_with_repair(text, context=context)
                 
                 if result.success:
-                    logger.debug(f"JSON repair successful using method: {result.repair_method}")
+                    log_with_context('debug', f"JSON repair successful using method: {result.repair_method}")
                     
                     # Apply the same post-processing logic as before
                     parsed = result.parsed_data
@@ -4283,7 +4530,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                     if isinstance(parsed, dict) and len(parsed) == 1:
                         sole_value = next(iter(parsed.values()))
                         if isinstance(sole_value, list):
-                            logger.debug("Unwrapped single-key object returned by LLM into list of operations.")
+                            log_with_context('debug', "Unwrapped single-key object returned by LLM into list of operations.")
                             parsed = sole_value
                     
                     # Handle empty results
@@ -4304,19 +4551,19 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                     # Fall back to legacy parsing
                     
             except Exception as e:
-                logger.error(f"Error in enhanced JSON parsing: {e}")
+                log_with_context('error', f"Error in enhanced JSON parsing: {e}")
                 # Fall back to legacy parsing
         
         # Legacy parsing fallback (simplified version of original logic)
-        logger.debug("Using legacy JSON parsing fallback")
+        log_with_context('debug', "Using legacy JSON parsing fallback")
         
         try:
             parsed = json.loads(text)
-            logger.debug("Successfully parsed JSON directly with legacy parser.")
+            log_with_context('debug', "Successfully parsed JSON directly with legacy parser.")
             if isinstance(parsed, dict) and len(parsed) == 1:
                 sole_value = next(iter(parsed.values()))
                 if isinstance(sole_value, list):
-                    logger.debug("Unwrapped single-key object returned by LLM into list of operations.")
+                    log_with_context('debug', "Unwrapped single-key object returned by LLM into list of operations.")
                     parsed = sole_value
             if parsed == {} or parsed == []:
                 logger.info("LLM returned empty object/array, treating as empty memory list")
@@ -4324,17 +4571,17 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             return parsed
         except json.JSONDecodeError as e:
             # Don't raise exception here, try fallback methods first
-            logger.debug(f"Direct JSON parsing failed, trying fallback methods: {e}")
+            log_with_context('debug', f"Direct JSON parsing failed, trying fallback methods: {e}")
 
         # Try extracting from code blocks
         code_block_pattern = r"```(?:json)?\s*(\[[\s\S]*?\]|\{[\s\S]*?\})\s*```"
         matches = re.findall(code_block_pattern, text)
         if matches:
-            logger.debug(f"Found {len(matches)} JSON code blocks (legacy fallback)")
+            log_with_context('debug', f"Found {len(matches)} JSON code blocks (legacy fallback)")
             for i, match in enumerate(matches):
                 try:
                     parsed = json.loads(match)
-                    logger.debug(f"Successfully parsed JSON from code block {i+1} (legacy fallback)")
+                    log_with_context('debug', f"Successfully parsed JSON from code block {i+1} (legacy fallback)")
                     if parsed == {} or parsed == []: continue
                     return parsed
                 except json.JSONDecodeError as e:
@@ -4386,13 +4633,16 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             mem1_embedding = await self._get_embedding(memory1_clean)
             mem2_embedding = await self._get_embedding(memory2_clean)
             if mem1_embedding is None or mem2_embedding is None:
-                logger.warning("Could not generate embeddings for similarity calculation. Falling back to text-based similarity.")
+                log_with_context('warning', "Could not generate embeddings for similarity calculation. Using text-based similarity.",
+                               component='EMBED', operation='similarity_fallback')
                 return self._calculate_memory_similarity(memory1, memory2)
             similarity = float(np.dot(mem1_embedding, mem2_embedding))
             return max(0.0, min(1.0, similarity))
         except Exception as e:
-            logger.error(f"Error calculating embedding similarity: {e}\n{traceback.format_exc()}")
-            logger.info("Falling back to text-based similarity due to unexpected error.")
+            log_with_context('error', "Error calculating embedding similarity",
+                           component='EMBED', operation='similarity_error', error=e)
+            log_with_context('info', "Falling back to text-based similarity due to unexpected error",
+                           component='EMBED', operation='similarity_fallback')
             return self._calculate_memory_similarity(memory1, memory2)
 
     # ----------------------------
@@ -4561,7 +4811,8 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
         try:
             return self._minhash_fingerprinter.estimate_jaccard_similarity(fingerprint1, fingerprint2)
         except Exception as e:
-            logger.warning(f"Error calculating fingerprint similarity: {e}")
+            log_with_context('warning', "Error calculating fingerprint similarity",
+                           component='MEMORY', operation='fingerprint_similarity', error=e)
             return 0.0
     
     def _get_enhanced_similarity_score(self, memory1: str, memory2: str) -> tuple[float, str]:
@@ -4590,12 +4841,13 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             # but text similarity for fine-grained matching
             combined_similarity = (0.7 * fingerprint_sim) + (0.3 * text_sim)
             
-            logger.debug(f"Enhanced similarity: fingerprint={fingerprint_sim:.3f}, text={text_sim:.3f}, combined={combined_similarity:.3f}")
+            log_with_context('debug', f"Enhanced similarity: fingerprint={fingerprint_sim:.3f}, text={text_sim:.3f}, combined={combined_similarity:.3f}")
             
             return combined_similarity, "fingerprint_enhanced"
             
         except Exception as e:
-            logger.warning(f"Error in enhanced similarity calculation, falling back to text-based: {e}")
+            log_with_context('warning', "Error in enhanced similarity calculation, using text-based",
+                           component='MEMORY', operation='enhanced_similarity', error=e)
             return self._calculate_memory_similarity(memory1, memory2), "text_fallback"
 
     # ----------------------------
@@ -4749,13 +5001,13 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                 rows_per_band = max(1, expected_signature_length // num_bands)
             self._lsh_index = self.LSHIndex(num_bands=num_bands, rows_per_band=rows_per_band)
             self._cached_lsh_signature_length = expected_signature_length
-            logger.debug(f"Initialized LSH index with {num_bands} bands, {rows_per_band} rows per band")
+            log_with_context('debug', f"Initialized LSH index with {num_bands} bands, {rows_per_band} rows per band")
         return self._lsh_index
     
     def _populate_lsh_index(self, existing_memories: List[Dict[str, Any]]) -> None:
         lsh_index = self._get_lsh_index()
         lsh_index.clear()
-        logger.debug(f"Populating LSH index with {len(existing_memories)} existing memories")
+        log_with_context('debug', f"Populating LSH index with {len(existing_memories)} existing memories")
         for memory in existing_memories:
             memory_id = memory.get("id")
             memory_content = memory.get("memory", "")
@@ -4771,7 +5023,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             fingerprint = self._get_memory_fingerprint(memory_content)
             lsh_index = self._get_lsh_index()
             candidates = lsh_index.find_candidates(fingerprint)
-            logger.debug(f"LSH found {len(candidates)} candidates for similarity checking")
+            log_with_context('debug', f"LSH found {len(candidates)} candidates for similarity checking")
             return candidates
         except Exception as e:
             logger.warning(f"Error in LSH candidate finding: {e}")
@@ -4814,7 +5066,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                     fingerprint2 = self._get_memory_fingerprint(existing_content)
                     score.fingerprint_similarity = self._calculate_fingerprint_similarity(fingerprint1, fingerprint2)
                 except Exception as e:
-                    logger.debug(f"Error calculating fingerprint similarity: {e}")
+                    log_with_context('debug', f"Error calculating fingerprint similarity: {e}")
                     score.fingerprint_similarity = 0.0
             
             # 2. Text Similarity (always calculated as baseline)
@@ -4828,7 +5080,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                         loop = asyncio.get_event_loop()
                         if loop.is_running():
                             # Already in async context - cannot use asyncio.run
-                            logger.debug("Skipping embedding similarity calculation in async context")
+                            log_with_context('debug', "Skipping embedding similarity calculation in async context")
                             score.embedding_similarity = 0.0
                         else:
                             embedding_sim = loop.run_until_complete(self._calculate_embedding_similarity(new_content, existing_content))
@@ -4838,7 +5090,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                         embedding_sim = asyncio.run(self._calculate_embedding_similarity(new_content, existing_content))
                         score.embedding_similarity = embedding_sim
                 except Exception as e:
-                    logger.debug(f"Error calculating embedding similarity: {e}")
+                    log_with_context('debug', f"Error calculating embedding similarity: {e}")
                     score.embedding_similarity = 0.0
             
             # 4. Length Similarity with safe division
@@ -4887,7 +5139,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             score.confidence_level = self._classify_confidence_level(score.combined_score)
             score.is_duplicate, score.primary_method, score.decision_factors = self._make_duplicate_decision(score)
             
-            logger.debug(f"Enhanced confidence score: combined={score.combined_score:.3f}, "
+            log_with_context('debug', f"Enhanced confidence score: combined={score.combined_score:.3f}, "
                         f"level={score.confidence_level}, duplicate={score.is_duplicate}")
             
             return score
@@ -4941,7 +5193,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             else:
                 return 0.0
         except Exception as e:
-            logger.debug(f"Error calculating temporal similarity: {e}")
+            log_with_context('debug', f"Error calculating temporal similarity: {e}")
             return 0.5
     
     def _calculate_content_type_similarity(self, content1: str, content2: str) -> float:
@@ -4968,7 +5220,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             union = len(types1.union(types2))
             return intersection / union if union > 0 else 0.0
         except Exception as e:
-            logger.debug(f"Error calculating content type similarity: {e}")
+            log_with_context('debug', f"Error calculating content type similarity: {e}")
             return 0.5
     
     def _classify_confidence_level(self, combined_score: float) -> str:
@@ -5010,7 +5262,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
             raise ValueError("user_id is required for retrieving memories")
         if not self._ensure_configuration_persistence():
             logger.warning("Configuration persistence check failed in get_relevant_memories, but continuing with current config")
-        logger.debug(f"Getting relevant memories for user_id: {user_id}, message: {current_message[:50]}...")
+        log_with_context('debug', f"Getting relevant memories for user_id: {user_id}, message: {current_message[:50]}...")
 
         import time
 
@@ -5042,10 +5294,10 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                     return []
                 elif user_embedding is not None:
                     user_embedding_dim = user_embedding.shape[0]
-                    logger.debug(f"User message embedding dimension: {user_embedding_dim}")
+                    log_with_context('debug', f"User message embedding dimension: {user_embedding_dim}")
             except Exception as e:
                 self.error_counters["embedding_errors"] += 1
-                logger.error(f"Error computing embedding for user message: {e}\n{traceback.format_exc()}")
+                log_with_context('error', f"Error computing embedding for user message: {e}\n{traceback.format_exc()}")
                 if not self.valves.use_llm_for_relevance:
                     logger.warning("Cannot calculate relevance due to embedding error and no LLM fallback.")
                     return []
@@ -5083,19 +5335,34 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                             logger.warning(f"Error calculating similarity for memory {mem_id}: {e}")
                             continue
                         else:
-                            logger.debug(f"No embedding available for memory {mem_id} even after attempted computation.")
+                            log_with_context('debug', f"No embedding available for memory {mem_id} even after attempted computation.")
                     else:
-                        logger.debug(f"No embedding available for memory {mem_id} even after attempted computation.")
+                        log_with_context('debug', f"No embedding available for memory {mem_id} even after attempted computation.")
 
                 vector_similarities.sort(reverse=True, key=lambda x: x[0])
-                logger.info(f"Calculated vector similarities for {len(vector_similarities)} memories. Top 3 scores: {[round(x[0], 3) for x in vector_similarities[:3]]}")
-                logger.info(f"THRESHOLDS: vector_similarity_threshold={self.internal_config.vector_similarity_threshold}, relevance_threshold={self.valves.relevance_threshold}")
+                log_with_context('debug', f"Calculated vector similarities for {len(vector_similarities)} memories",
+                               component='MEMORY', user_id=user_id, operation='vector_similarity',
+                               context={'top_3_scores': [round(x[0], 3) for x in vector_similarities[:3]]})
+                log_with_context('debug', "Relevance thresholds",
+                               component='MEMORY', user_id=user_id, operation='thresholds',
+                               context={
+                                   'vector_threshold': self.internal_config.vector_similarity_threshold,
+                                   'relevance_threshold': self.valves.relevance_threshold
+                               })
                 initial_filter_threshold = min(0.3, self.internal_config.vector_similarity_threshold)
                 top_n = self.internal_config.top_n_memories
                 filtered_by_vector = [mem for sim, mem in vector_similarities if sim >= initial_filter_threshold][:top_n]
-                logger.info(f"Initial vector filter selected {len(filtered_by_vector)} of {len(existing_memories)} memories (Initial threshold: {initial_filter_threshold}, Top N: {top_n})")
+                log_with_context('info', f"Initial vector filter selected {len(filtered_by_vector)} of {len(existing_memories)} memories",
+                               component='MEMORY', user_id=user_id, operation='vector_filter',
+                               context={
+                                   'selected': len(filtered_by_vector),
+                                   'total': len(existing_memories),
+                                   'threshold': initial_filter_threshold,
+                                   'top_n': top_n
+                               })
             else:
-                logger.warning("User embedding failed, proceeding with all memories for potential LLM check.")
+                log_with_context('warning', "User embedding failed, proceeding with all memories for LLM check",
+                               component='MEMORY', user_id=user_id, operation='embedding_fallback')
                 filtered_by_vector = existing_memories
 
 
@@ -5111,14 +5378,14 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                 relevant_memories = []
                 # Use the already calculated and sorted vector similarities
                 for sim_score, mem in vector_similarities: # Iterate through the originally sorted list
-                    logger.debug(f"Checking memory {mem.get('id', 'unknown')}: score={round(sim_score, 3)} vs threshold={final_relevance_threshold}")
+                    log_with_context('debug', f"Checking memory {mem.get('id', 'unknown')}: score={round(sim_score, 3)} vs threshold={final_relevance_threshold}")
                     if sim_score >= final_relevance_threshold:
                         relevant_memories.append(
                             {"id": mem["id"], "memory": mem["memory"], "relevance": sim_score} # Use vector score as relevance
                         )
-                        logger.debug(f"✓ Memory {mem.get('id', 'unknown')} passed threshold")
+                        log_with_context('debug', f"✓ Memory {mem.get('id', 'unknown')} passed threshold")
                     else:
-                        logger.debug(f"✗ Memory {mem.get('id', 'unknown')} below threshold")
+                        log_with_context('debug', f"✗ Memory {mem.get('id', 'unknown')} below threshold")
 
                 # Limit to configured number
                 final_top_n = self.internal_config.related_memories_n
@@ -5177,7 +5444,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
                 memories_for_llm = filtered_by_vector # Use the vector-filtered list
 
                 if not memories_for_llm:
-                     logger.debug("No memories passed vector filter for LLM relevance check.")
+                     log_with_context('debug', "No memories passed vector filter for LLM relevance check.")
                      return []
 
                 # Build the prompt for LLM
@@ -5270,7 +5537,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
 
                     if not llm_response_text or llm_response_text.startswith("Error:"):
                         if llm_response_text:
-                            logger.error(
+                            log_with_context('error', 
                                 f"Error from LLM during memory relevance: {llm_response_text}"
                             )
                         # If LLM fails, we might return empty or potentially fall back
@@ -5307,7 +5574,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                         key = str(hash((user_embedding.tobytes(), mem_emb.tobytes())))
                                         self.relevance_cache[key] = (score, now)
                                     else:
-                                         logger.debug(f"Cannot cache relevance for {mem_id}, embedding missing.")
+                                         log_with_context('debug', f"Cannot cache relevance for {mem_id}, embedding missing.")
                             else:
                                 logger.warning(f"Invalid item format in LLM relevance response: {item}")
 
@@ -5365,7 +5632,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         try:
             user = Users.get_user_by_id(user_id)
             if not user:
-                logger.error(f"User not found: {user_id}")
+                log_with_context('error', f"User not found: {user_id}")
                 return []
 
             # Get existing memories for deduplication
@@ -5373,7 +5640,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             if self.valves.deduplicate_memories:
                 existing_memories = await self._get_formatted_memories(user_id)
 
-            logger.debug(f"Processing {len(memories)} memory operations")
+            log_with_context('debug', f"Processing {len(memories)} memory operations")
 
             # First filter for duplicates if enabled
             processed_memories = []
@@ -5383,7 +5650,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 for mem in existing_memories:
                     existing_contents.append(mem["memory"])
 
-                logger.debug(f"[DEDUPE] Existing memories being checked against: {existing_contents}")
+                log_with_context('debug', f"[DEDUPE] Existing memories being checked against: {existing_contents}")
 
                 # Decide similarity method and corresponding threshold
                 use_embeddings = self.valves.use_embeddings_for_deduplication
@@ -5399,7 +5666,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     threshold_to_use = self.valves.similarity_threshold
                     method_desc = "text-based"
                 
-                logger.debug(
+                log_with_context('debug', 
                     f"Using {method_desc} similarity for deduplication. "
                     f"Threshold: {threshold_to_use}"
                 )
@@ -5412,16 +5679,16 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 )
                 
                 if use_lsh:
-                    logger.debug(f"Using LSH optimization for {len(existing_memories)} existing memories")
+                    log_with_context('debug', f"Using LSH optimization for {len(existing_memories)} existing memories")
                     # Populate LSH index with existing memories
                     self._populate_lsh_index(existing_memories)
                 else:
-                    logger.debug(f"Using direct comparison (LSH disabled or insufficient memories: {len(existing_memories)})")
+                    log_with_context('debug', f"Using direct comparison (LSH disabled or insufficient memories: {len(existing_memories)})")
 
                 # Check each new memory against existing ones
                 for new_memory_idx, memory_dict in enumerate(memories):
                     if memory_dict["operation"] == "NEW":
-                        logger.debug(f"[DEDUPE CHECK {new_memory_idx+1}/{len(memories)}] Processing NEW memory: {memory_dict}") # LOG START
+                        log_with_context('debug', f"[DEDUPE CHECK {new_memory_idx+1}/{len(memories)}] Processing NEW memory: {memory_dict}") # LOG START
                         # Format the memory content
                         operation = MemoryOperation(**memory_dict)
                         formatted_content = self._format_memory_content(operation)
@@ -5433,7 +5700,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         ):
                             pref_kwds = [kw.strip() for kw in self.internal_config.preference_keywords_no_dedupe.split(',') if kw.strip()]
                             if any(kw in formatted_content.lower() for kw in pref_kwds):
-                                logger.debug("Bypassing deduplication for short preference statement: '%s'", formatted_content)
+                                log_with_context('debug', "Bypassing deduplication for short preference statement: '%s'", formatted_content)
                                 processed_memories.append(memory_dict)
                                 continue  # Skip duplicate checking entirely for this memory
 
@@ -5457,7 +5724,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         if use_lsh:
                             # Use LSH to find candidate memory IDs
                             candidate_ids = self._find_lsh_candidates(formatted_content)
-                            logger.debug(f"LSH narrowed down to {len(candidate_ids)} candidates from {len(existing_memories)} total memories")
+                            log_with_context('debug', f"LSH narrowed down to {len(candidate_ids)} candidates from {len(existing_memories)} total memories")
                             
                             # Build list of candidates to check
                             candidates_to_check = []
@@ -5487,14 +5754,14 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                 # Use the enhanced decision from confidence scoring
                                 if confidence_score.is_duplicate:
                                     existing_id = existing_mem_dict.get("id", "unknown")
-                                    logger.debug(
+                                    log_with_context('debug', 
                                         f"  -> Enhanced duplicate found vs {existing_id} "
                                         f"(Combined: {confidence_score.combined_score:.3f}, "
                                         f"Level: {confidence_score.confidence_level}, "
                                         f"Method: {confidence_score.primary_method}, "
                                         f"Factors: {confidence_score.decision_factors})"
                                     )
-                                    logger.debug(
+                                    log_with_context('debug', 
                                         f"Skipping duplicate NEW memory (enhanced confidence): {formatted_content[:50]}..."
                                     )
                                     is_duplicate = True
@@ -5545,10 +5812,10 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                     
                                 if similarity_score >= threshold_to_use:
                                     existing_id = existing_mem_dict.get("id", "unknown")
-                                    logger.debug(
+                                    log_with_context('debug', 
                                         f"  -> Duplicate found vs existing mem {existing_id} (Similarity: {similarity_score:.3f}, Method: {similarity_method}, Threshold: {threshold_to_use})"
                                     )
-                                    logger.debug(
+                                    log_with_context('debug', 
                                         f"Skipping duplicate NEW memory (similarity: {similarity_score:.2f}, method: {similarity_method}): {formatted_content[:50]}..."
                                     )
                                     is_duplicate = True
@@ -5557,46 +5824,46 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                     break # Stop checking against other existing memories for this new one
 
                         if not is_duplicate:
-                            logger.debug(f"  -> No duplicate found. Adding to processed list: {formatted_content[:50]}...")
+                            log_with_context('debug', f"  -> No duplicate found. Adding to processed list: {formatted_content[:50]}...")
                             processed_memories.append(memory_dict)
                         else:
-                             logger.debug(f"NEW memory was identified as duplicate and skipped: {formatted_content[:50]}...")
+                             log_with_context('debug', f"NEW memory was identified as duplicate and skipped: {formatted_content[:50]}...")
                     else:
                         # Keep all UPDATE and DELETE operations
-                        logger.debug(f"Keeping non-NEW operation: {memory_dict['operation']} ID: {memory_dict.get('id', 'N/A')}")
+                        log_with_context('debug', f"Keeping non-NEW operation: {memory_dict['operation']} ID: {memory_dict.get('id', 'N/A')}")
                         processed_memories.append(memory_dict)
             else:
-                logger.debug("Deduplication skipped (valve disabled or no existing memories). Processing all operations.")
+                log_with_context('debug', "Deduplication skipped (valve disabled or no existing memories). Processing all operations.")
                 processed_memories = memories
 
             # Process the filtered memories
-            logger.debug(f"Executing {len(processed_memories)} filtered memory operations.")
+            log_with_context('debug', f"Executing {len(processed_memories)} filtered memory operations.")
             for idx, memory_dict in enumerate(processed_memories):
-                logger.debug(f"Executing operation {idx + 1}/{len(processed_memories)}: {memory_dict}")
+                log_with_context('debug', f"Executing operation {idx + 1}/{len(processed_memories)}: {memory_dict}")
                 try:
                     # Validate memory operation
                     operation = MemoryOperation(**memory_dict)
                     # Execute the memory operation
                     await self._execute_memory_operation(operation, user)
                     # If successful, add to our list
-                    logger.debug(f"Successfully executed operation: {operation.operation} ID: {operation.id}")
+                    log_with_context('debug', f"Successfully executed operation: {operation.operation} ID: {operation.id}")
                     successfully_saved_ops.append(memory_dict)
                 except ValueError as e:
-                    logger.error(f"Invalid memory operation during execution phase: {e} {memory_dict}")
+                    log_with_context('error', f"Invalid memory operation during execution phase: {e} {memory_dict}")
                     self.error_counters["memory_crud_errors"] += 1 # Increment error counter
                     continue
                 except Exception as e:
-                    logger.error(f"Error executing memory operation in process_memories: {e} {memory_dict}")
+                    log_with_context('error', f"Error executing memory operation in process_memories: {e} {memory_dict}")
                     self.error_counters["memory_crud_errors"] += 1 # Increment error counter
                     continue
 
-            logger.debug(
+            log_with_context('debug', 
                 f"Successfully executed {len(successfully_saved_ops)} memory operations out of {len(processed_memories)} processed.")
             # Add confirmation message if any memory was added or updated
             if successfully_saved_ops:
                 # Check if any operation was NEW or UPDATE
                 if any(op.get("operation") in ["NEW", "UPDATE"] for op in successfully_saved_ops):
-                    logger.debug("Attempting to add confirmation message.") # Log confirmation attempt
+                    log_with_context('debug', "Attempting to add confirmation message.") # Log confirmation attempt
                     try:
                         # Request import removed - not used
 
@@ -5656,14 +5923,14 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                 memory_clean, normalize_embeddings=True
                             )
                             self.memory_embeddings[mem_id] = memory_embedding
-                            logger.debug(f"Generated and cached embedding for new memory ID: {mem_id}")
+                            log_with_context('debug', f"Generated and cached embedding for new memory ID: {mem_id}")
                         except Exception as e:
                             logger.warning(f"Failed to generate embedding for new memory: {e}")
                             # Non-critical error, don't raise
 
             except Exception as e:
                 self.error_counters["memory_crud_errors"] += 1
-                logger.error(
+                log_with_context('error', 
                     f"Error creating memory (operation=NEW, user_id={user_id}): {e}\n{traceback.format_exc()}"
                 )
                 raise
@@ -5705,7 +5972,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                 )
                                 # Store with the new ID from the result
                                 self.memory_embeddings[new_mem_id] = memory_embedding
-                                logger.debug(
+                                log_with_context('debug', 
                                     f"Updated embedding for memory ID: {new_mem_id} (was: {operation.id})"
                                 )
 
@@ -5722,7 +5989,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     logger.warning(f"Memory {operation.id} not found for UPDATE for user {user_id}")
             except Exception as e:
                 self.error_counters["memory_crud_errors"] += 1
-                logger.error(
+                log_with_context('error', 
                     f"Error updating memory (operation=UPDATE, memory_id={operation.id}, user_id={user_id}): {e}\n{traceback.format_exc()}"
                 )
                 raise
@@ -5754,11 +6021,11 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 # Remove embedding
                 if operation.id in self.memory_embeddings:
                     del self.memory_embeddings[operation.id]
-                    logger.debug(f"Removed embedding for deleted memory ID: {operation.id}")
+                    log_with_context('debug', f"Removed embedding for deleted memory ID: {operation.id}")
 
             except Exception as e:
                 self.error_counters["memory_crud_errors"] += 1
-                logger.error(
+                log_with_context('error', 
                     f"Error deleting memory (operation=DELETE, memory_id={operation.id}, user_id={user_id}): {e}\n{traceback.format_exc()}"
                 )
                 raise
@@ -5832,13 +6099,13 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         session = await self._get_aiohttp_session()
         
         for attempt in range(1, max_retries + 2):  # +2 because we start at 1 and want max_retries+1 attempts
-            logger.debug(f"API request attempt {attempt}/{max_retries+1} to {api_url}")
+            log_with_context('debug', f"API request attempt {attempt}/{max_retries+1} to {api_url}")
             
             try:
                 # Make the API call with timeout
                 timeout = aiohttp.ClientTimeout(total=request_timeout)
                 async with session.post(api_url, json=data, headers=headers, timeout=timeout) as response:
-                    logger.debug(f"API response status: {response.status}")
+                    log_with_context('debug', f"API response status: {response.status}")
                     
                     if response.status == 200:
                         # Success - parse response
@@ -5847,7 +6114,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         if "application/x-ndjson" in content_type:
                             # Handle NDJSON (Ollama may return this)
                             raw_text = await response.text()
-                            logger.debug(f"Received NDJSON response length: {len(raw_text)}")
+                            log_with_context('debug', f"Received NDJSON response length: {len(raw_text)}")
                             
                             last_json = None
                             for line in raw_text.strip().splitlines():
@@ -5858,7 +6125,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                             
                             if last_json is None:
                                 error_msg = "Could not decode NDJSON response"
-                                logger.error(error_msg)
+                                log_with_context('error', error_msg)
                                 if attempt > max_retries:
                                     return False, error_msg
                                 else:
@@ -5871,7 +6138,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         
                         # Record success for circuit breaker
                         self._record_circuit_breaker_success(api_url, provider_type)
-                        logger.debug(f"API request successful: {json.dumps(response_data)[:200]}...")
+                        log_with_context('debug', f"API request successful: {json.dumps(response_data)[:200]}...")
                         return True, response_data
                         
                     else:
@@ -5952,7 +6219,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     return False, f"API connection error after {max_retries} attempts: {str(e)}"
                     
             except Exception as e:
-                logger.error(f"Attempt {attempt} failed: Unexpected error during API request: {e}")
+                log_with_context('error', f"Attempt {attempt} failed: Unexpected error during API request: {e}")
                 self._record_circuit_breaker_failure(api_url, provider_type)
                 
                 if attempt <= max_retries:
@@ -6135,13 +6402,13 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         api_key = self.valves.llm_api_key
 
         logger.info(f"LLM Query: Provider={provider_type}, Model={model}, URL={api_url}")
-        logger.debug(f"System prompt length: {len(system_prompt)}, User prompt length: {len(user_prompt)}")
+        log_with_context('debug', f"System prompt length: {len(system_prompt)}, User prompt length: {len(user_prompt)}")
 
         # Track LLM call frequency
         try:
             self.metrics["llm_call_count"] = self.metrics.get("llm_call_count", 0) + 1
         except Exception as metric_err:
-            logger.debug(f"Unable to increment llm_call_count metric: {metric_err}")
+            log_with_context('debug', f"Unable to increment llm_call_count metric: {metric_err}")
 
         # Perform health check if enabled
         if self.internal_config.enable_health_checks:
@@ -6166,7 +6433,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         if self.valves.enable_feature_detection:
             try:
                 provider_features = await self._get_provider_features(provider_type, api_url, api_key)
-                logger.debug(f"Provider features for {provider_type}: {provider_features}")
+                log_with_context('debug', f"Provider features for {provider_type}: {provider_features}")
             except Exception as e:
                 logger.warning(f"Feature detection failed, using defaults: {e}")
                 provider_features = {
@@ -6181,12 +6448,12 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 "supports_system_messages": True,
                 "supports_streaming": True
             }
-            logger.debug("Feature detection disabled, using default capabilities")
+            log_with_context('debug', "Feature detection disabled, using default capabilities")
 
         try:
             # Build request payload using consolidated helper
             data = self._build_llm_request_payload(system_prompt_with_date, user_prompt, provider_type, model, provider_features)
-            logger.debug(f"Request payload: {json.dumps(data)[:500]}...")
+            log_with_context('debug', f"Request payload: {json.dumps(data)[:500]}...")
             
             # Build headers using consolidated helper
             headers = self._build_llm_request_headers(provider_type, api_key)
@@ -6291,12 +6558,12 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
 
         # If no confirmation necessary, exit early
         if not confirmation:
-            logger.debug("No memory confirmation message needed")
+            log_with_context('debug', "No memory confirmation message needed")
             return
 
         # Critical fix: Make a selective copy of the messages array
         try:
-            logger.debug("Making selective copy of messages array for safe modification")
+            log_with_context('debug', "Making selective copy of messages array for safe modification")
             messages_copy = self._copy_messages(body["messages"])
 
             # Find the last assistant message
@@ -6317,15 +6584,16 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 )
 
                 # Replace the entire messages array in body
-                logger.debug(
+                log_with_context('debug', 
                     f"Replacing messages array with modified copy containing confirmation: {confirmation}"
                 )
                 body["messages"] = messages_copy
             else:
-                logger.debug("No assistant message found to append confirmation")
+                log_with_context('debug', "No assistant message found to append confirmation")
 
         except Exception as e:
-            logger.error(f"Error adding confirmation message: {e}")
+            log_with_context('error', "Error adding confirmation message",
+                           component='OUTLET', operation='confirmation_error', error=e)
             # Don't modify anything if there's an error
 
     # Cleanup method for aiohttp session and background tasks
@@ -6343,7 +6611,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     # Expected when cancelling
                     pass
                 except Exception as e:
-                    logger.error(f"Error while cancelling task: {e}")
+                    log_with_context('error', f"Error while cancelling task: {e}")
         
         # Clear task tracking set
         self._background_tasks.clear()
@@ -6513,7 +6781,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             return
 
         # Placeholder for potential future dynamic tasks
-        logger.debug("_initialize_background_tasks called – no dynamic tasks to start.")
+        log_with_context('debug', "_initialize_background_tasks called – no dynamic tasks to start.")
         self._background_tasks_started = True
 
     # ------------------------------------------------------------------
@@ -6532,7 +6800,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             self.error_counters[counter_name] += 1
         except Exception as e:
             # Should never fail, but guard to avoid cascading errors
-            logger.debug(f"_increment_error_counter failed for '{counter_name}': {e}")
+            log_with_context('debug', f"_increment_error_counter failed for '{counter_name}': {e}")
 
     # --- Consolidated Embedding Functions ---
 
@@ -6545,7 +6813,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         provider_type = self.valves.embedding_provider_type
         
         if not text:
-            logger.debug("Skipping embedding for empty text.")
+            log_with_context('debug', "Skipping embedding for empty text.")
             return None
 
         start_time = time.time()
@@ -6563,7 +6831,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     
                     embedding_vector = local_model.encode(truncated_text, normalize_embeddings=True)
                 else:
-                    logger.error("Local embedding provider configured, but model failed to load.")
+                    log_with_context('error', "Local embedding provider configured, but model failed to load.")
                     self.error_counters["embedding_errors"] += 1 # Count as error
             
             elif provider_type == "openai_compatible":
@@ -6574,7 +6842,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 model_name = self._validate_embedding_model_name(self.valves.embedding_model_name)
                 
                 if not api_url or not api_key:
-                    logger.error("Attempted to call embedding API without proper URL or Key configuration.")
+                    log_with_context('error', "Attempted to call embedding API without proper URL or Key configuration.")
                     self.error_counters["embedding_errors"] += 1
                     embedding_vector = None
                 else:
@@ -6607,23 +6875,23 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         if response_data.get("data") and isinstance(response_data["data"], list) and len(response_data["data"]) > 0:
                             embedding_list = response_data["data"][0].get("embedding")
                             if embedding_list and isinstance(embedding_list, list):
-                                logger.debug(f"Successfully received embedding vector of dimension {len(embedding_list)} from API.")
+                                log_with_context('debug', f"Successfully received embedding vector of dimension {len(embedding_list)} from API.")
                                 embedding_vector = np.array(embedding_list, dtype=np.float32)
                             else:
-                                logger.error(f"Could not extract embedding from API response format: {str(response_data)[:200]}...")
+                                log_with_context('error', f"Could not extract embedding from API response format: {str(response_data)[:200]}...")
                                 embedding_vector = None
                         else:
-                            logger.error(f"Could not extract embedding from API response format: {str(response_data)[:200]}...")
+                            log_with_context('error', f"Could not extract embedding from API response format: {str(response_data)[:200]}...")
                             embedding_vector = None
                     else:
-                        logger.error(f"Embedding API request failed: {response_data}")
+                        log_with_context('error', f"Embedding API request failed: {response_data}")
                         embedding_vector = None
                     
                     if embedding_vector is None:
                         self.error_counters["embedding_errors"] += 1
             
             else:
-                logger.error(f"Invalid embedding_provider_type configured: {provider_type}")
+                log_with_context('error', f"Invalid embedding_provider_type configured: {provider_type}")
                 self.error_counters["embedding_errors"] += 1 # Count as error
 
         except Exception as e:
@@ -6638,7 +6906,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                  try:
                      embedding_vector = np.array(embedding_vector, dtype=np.float32)
                  except Exception as array_err:
-                      logger.error(f"Failed to convert embedding to numpy array: {array_err}")
+                      log_with_context('error', f"Failed to convert embedding to numpy array: {array_err}")
                       self.error_counters["embedding_errors"] += 1
                       return None
             # Normalize just in case encode/API didn't - with safe bounds checking
@@ -6654,7 +6922,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 logger.warning("Generated embedding vector is empty or invalid")
                 return None
             
-            logger.debug(f"Generated embedding via {provider_type} in {end_time - start_time:.3f}s, dim: {embedding_vector.shape}")
+            log_with_context('debug', f"Generated embedding via {provider_type} in {end_time - start_time:.3f}s, dim: {embedding_vector.shape}")
             EMBEDDING_LATENCY.labels(provider).observe(time.perf_counter() - _embed_start)
             return embedding_vector
         else:
@@ -6722,7 +6990,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 self._api_version_info = version_info
                 logger.info(f"OpenWebUI API version detected and cached: {version_info}")
             elif version_info['confidence'] in ['medium', 'high']:
-                logger.debug(f"OpenWebUI API version detected: {version_info}")
+                log_with_context('debug', f"OpenWebUI API version detected: {version_info}")
                 
             # Increment detection counter for analytics
             self._version_detection_count += 1
@@ -6762,7 +7030,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     
             # Version-specific logging adjustments
             if version_info['confidence'] == 'high':
-                logger.debug(f"Applied {version_info['api_pattern']} API compatibility adjustments")
+                log_with_context('debug', f"Applied {version_info['api_pattern']} API compatibility adjustments")
                 
             return compatible_body
             
@@ -6800,7 +7068,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             known_params = {'__event_emitter__', '__user__', 'body', 'event'}
             unknown_params = set(kwargs.keys()) - known_params
             if unknown_params:
-                logger.debug(f"Encountered unknown parameters (will ignore): {unknown_params}")
+                log_with_context('debug', f"Encountered unknown parameters (will ignore): {unknown_params}")
                 
             # Handle deprecated parameters specifically mentioned in compatibility reports
             deprecated_params = ['bypass_prompt_processing', 'prompt']
@@ -6931,7 +7199,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             role = message.get('role', 'user')
             role = self._safe_str_conversion(role).lower()
             if role not in ['user', 'assistant', 'system']:
-                logger.debug(f"Invalid message role '{role}' - defaulting to 'user'")
+                log_with_context('debug', f"Invalid message role '{role}' - defaulting to 'user'")
                 role = 'user'
             sanitized_msg['role'] = role
             
@@ -7034,7 +7302,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             # Handle parameter compatibility - support both old and new API patterns
             user_info = __user__ if __user__ else normalized_body.get("user", {})
             if not user_info or not user_info.get("id"):
-                logger.warning("Sync inlet: No user info available, skipping processing")
+                log_with_context('warning', "Sync inlet: No user info available, skipping processing",
+                               component='INLET', operation='sync_no_user')
                 return normalized_body
             
             # Improved event loop management for OpenWebUI 2024
@@ -7058,7 +7327,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             return result
                     
         except Exception as e:
-            logger.error(f"Error in sync inlet: {e}\n{traceback.format_exc()}")
+            log_with_context('error', "Error in sync inlet",
+                           component='INLET', operation='sync_error', error=e)
             # Never raise exceptions - return body unchanged
             return body
     
@@ -7082,7 +7352,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             # Handle parameter compatibility - support both old and new API patterns
             user_info = __user__ if __user__ else normalized_body.get("user", {})
             if not user_info or not user_info.get("id"):
-                logger.warning("Sync outlet: No user info available, skipping processing")
+                log_with_context('warning', "Sync outlet: No user info available, skipping processing",
+                               component='OUTLET', operation='sync_no_user')
                 return normalized_body
             
             # Improved event loop management for OpenWebUI 2024
@@ -7106,7 +7377,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             return result
                     
         except Exception as e:
-            logger.error(f"Error in sync outlet: {e}\n{traceback.format_exc()}")
+            log_with_context('error', "Error in sync outlet",
+                           component='OUTLET', operation='sync_error', error=e)
             # Never raise exceptions - return body unchanged
             return body
     
@@ -7129,7 +7401,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
                     # Already in async context - create a task to run in background
-                    logger.info(f"Sync {method_name} called from async context - scheduling async execution")
+                    log_with_context('info', f"Sync {method_name} called from async context - scheduling async execution",
+                                   component='FILTER', operation='sync_to_async')
                     
                     # Already in async context - we need to handle this differently
                     # For OpenWebUI, we'll create a background task that won't block
@@ -7142,7 +7415,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         try:
                             # Run the coroutine
                             result = await coro
-                            logger.info(f"{method_name} background processing completed successfully")
+                            log_with_context('info', f"{method_name} background processing completed successfully",
+                                           component='FILTER', operation='async_complete')
                             # For inlet, we want to extract memories but return original body
                             # For outlet, we want to inject memories but process happens async
                             if method_name == "inlet":
@@ -7152,7 +7426,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                                 # Memory injection for outlet - return processed result
                                 return result
                         except Exception as e:
-                            logger.error(f"Background {method_name} processing error: {e}\n{traceback.format_exc()}")
+                            log_with_context('error', f"Background {method_name} processing error: {e}\n{traceback.format_exc()}")
                             return fallback_body
                     
                     # Create and track the background task
@@ -7163,7 +7437,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     self._background_tasks = [t for t in self._background_tasks if not t.done()]
                     
                     # Log that we're processing in background
-                    logger.info(f"{method_name} scheduled for background processing (OpenWebUI async context)")
+                    log_with_context('info', f"{method_name} scheduled for background processing (OpenWebUI async context)",
+                                   component='FILTER', operation='async_scheduled')
                     
                     # Return the fallback body immediately for OpenWebUI
                     return fallback_body
@@ -7189,12 +7464,13 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                             if pending:
                                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
                         except Exception as cleanup_error:
-                            logger.debug(f"Error cleaning up loop tasks: {cleanup_error}")
+                            log_with_context('debug', f"Error cleaning up loop tasks: {cleanup_error}")
                         finally:
                             loop.close()
                             
         except Exception as e:
-            logger.error(f"Error in {method_name} async execution: {e}\\n{traceback.format_exc()}")
+            log_with_context('error', f"Error in {method_name} async execution",
+                           component='FILTER', operation='async_error', error=e)
             return fallback_body
     
     def stream(self, event: dict, **kwargs) -> dict:
@@ -7212,7 +7488,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         try:
             # Log any unknown parameters for debugging
             if kwargs:
-                logger.debug(f"Stream method received unknown parameters (ignoring): {list(kwargs.keys())}")
+                log_with_context('debug', f"Stream method received unknown parameters (ignoring): {list(kwargs.keys())}")
             
             # -----------------------------------------------------------
             # Filter Orchestration System Integration for Stream
@@ -7228,20 +7504,20 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                     if self.valves.enable_stream_filtering:
                         event = self._process_stream_event(event)
                     else:
-                        logger.debug(f"Stream event received: {event.get('type', 'unknown')}")
+                        log_with_context('debug', f"Stream event received: {event.get('type', 'unknown')}")
                     
                     # Record successful completion
                     self._record_operation_success("stream", operation_start_time)
                     
                 except Exception as orch_error:
-                    logger.debug(f"Filter orchestration error in stream: {orch_error}")
+                    log_with_context('debug', f"Filter orchestration error in stream: {orch_error}")
                     self._record_operation_failure("stream", operation_start_time, str(orch_error))
             else:
                 # Standard processing without orchestration
                 if self.valves.enable_stream_filtering:
                     event = self._process_stream_event(event)
                 else:
-                    logger.debug(f"Stream event received: {event.get('type', 'unknown')}")
+                    log_with_context('debug', f"Stream event received: {event.get('type', 'unknown')}")
             
             return event
             
@@ -7250,7 +7526,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             if self.internal_config.enable_filter_orchestration:
                 self._record_operation_failure("stream", time.time(), str(e))
             
-            logger.error(f"Error in sync stream: {e}\n{traceback.format_exc()}")
+            log_with_context('error', "Error in sync stream",
+                           component='FILTER', operation='stream_error', error=e)
             # Never raise exceptions - return event unchanged
             return event
 
@@ -7280,11 +7557,12 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 # Process direct message content
                 event = self._filter_message_content(event)
                 
-            logger.debug(f"Processed stream event: {event_type}")
+            log_with_context('debug', f"Processed stream event: {event_type}")
             return event
             
         except Exception as e:
-            logger.error(f"Error processing stream event: {e}")
+            log_with_context('error', "Error processing stream event",
+                           component='FILTER', operation='stream_event_error', error=e)
             return event
     
     def _filter_streaming_content(self, event: dict) -> dict:
@@ -7309,12 +7587,13 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         
                         # Log filtering if content was modified
                         if original_content != filtered_content:
-                            logger.debug(f"Stream content filtered: {len(original_content)} -> {len(filtered_content)} chars")
+                            log_with_context('debug', f"Stream content filtered: {len(original_content)} -> {len(filtered_content)} chars")
             
             return event
             
         except Exception as e:
-            logger.error(f"Error filtering streaming content: {e}")
+            log_with_context('error', "Error filtering streaming content",
+                           component='FILTER', operation='stream_filter_error', error=e)
             return event
     
     def _filter_message_content(self, event: dict) -> dict:
@@ -7335,12 +7614,13 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 
                 # Log filtering if content was modified
                 if original_content != filtered_content:
-                    logger.debug(f"Message content filtered: {len(original_content)} -> {len(filtered_content)} chars")
+                    log_with_context('debug', f"Message content filtered: {len(original_content)} -> {len(filtered_content)} chars")
             
             return event
             
         except Exception as e:
-            logger.error(f"Error filtering message content: {e}")
+            log_with_context('error', "Error filtering message content",
+                           component='FILTER', operation='message_filter_error', error=e)
             return event
     
     def _apply_content_filters(self, content: str) -> str:
@@ -7369,7 +7649,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             return filtered_content
             
         except Exception as e:
-            logger.error(f"Error applying content filters: {e}")
+            log_with_context('error', "Error applying content filters",
+                           component='FILTER', operation='apply_filters_error', error=e)
             return content
     
     def _filter_pii_content(self, content: str) -> str:
@@ -7408,7 +7689,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             return filtered_content
             
         except Exception as e:
-            logger.error(f"Error filtering PII content: {e}")
+            log_with_context('error', "Error filtering PII content",
+                           component='FILTER', operation='pii_filter_error', error=e)
             return content
     
     # -----------------------------------------------------------
@@ -7441,12 +7723,13 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             
             # Log the preparation (using context for debugging)
             if prepared_content != content:
-                logger.debug(f"Content prepared for database storage ({context}): {len(content)} -> {len(prepared_content)} chars")
+                log_with_context('debug', f"Content prepared for database storage ({context}): {len(content)} -> {len(prepared_content)} chars")
             
             return prepared_content
             
         except Exception as e:
-            logger.error(f"Error preparing content for database ({context}): {e}")
+            log_with_context('error', f"Error preparing content for database ({context})",
+                           component='FILTER', operation='database_prep_error', error=e)
             return content
     
     def _restore_content_from_database(self, content: str, context: str = "general") -> str:
@@ -7473,12 +7756,13 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             if self.valves.enable_pii_filtering and self.valves.pii_filter_mode == "encrypt":
                 # In a real implementation, this would decrypt the PII
                 # For now, we'll just return the content as-is
-                logger.debug(f"Encrypted PII restoration for context: {context}")
+                log_with_context('debug', f"Encrypted PII restoration for context: {context}")
             
             return restored_content
             
         except Exception as e:
-            logger.error(f"Error restoring content from database ({context}): {e}")
+            log_with_context('error', f"Error restoring content from database ({context})",
+                           component='FILTER', operation='database_restore_error', error=e)
             return content
     
     # -----------------------------------------------------------
@@ -7523,7 +7807,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 await self._safe_emit(event_emitter, event)
             
         except Exception as e:
-            logger.error(f"Error emitting enhanced event: {e}")
+            log_with_context('error', "Error emitting enhanced event",
+                           component='FILTER', operation='emit_enhanced_error', error=e)
     
     async def _emit_batched_event(self, event_emitter, event: dict, batch_key: str) -> None:
         """
@@ -7550,7 +7835,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                 await self._flush_event_batch(event_emitter, batch_key)
             
         except Exception as e:
-            logger.error(f"Error handling batched event: {e}")
+            log_with_context('error', "Error handling batched event",
+                           component='FILTER', operation='batch_handle_error', error=e)
     
     async def _flush_event_batch(self, event_emitter, batch_key: str) -> None:
         """
@@ -7584,7 +7870,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             del self._event_batches[batch_key]
             
         except Exception as e:
-            logger.error(f"Error flushing event batch: {e}")
+            log_with_context('error', "Error flushing event batch",
+                           component='FILTER', operation='batch_flush_error', error=e)
     
     # -----------------------------------------------------------
     # OpenWebUI 2024 Compliance Validation
@@ -7742,7 +8029,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             return status
             
         except Exception as e:
-            logger.error(f"Error getting orchestration status: {e}")
+            log_with_context('error', "Error getting orchestration status",
+                           component='FILTER', operation='orchestration_status_error', error=e)
             return {"orchestration_enabled": True, "error": str(e)}
 
     def get_conflict_report(self) -> Dict[str, Any]:
@@ -7771,7 +8059,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             }
             
         except Exception as e:
-            logger.error(f"Error generating conflict report: {e}")
+            log_with_context('error', "Error generating conflict report",
+                           component='FILTER', operation='conflict_report_error', error=e)
             return {"conflict_detection_enabled": True, "error": str(e)}
 
     def _register_orchestration_endpoints(self):
