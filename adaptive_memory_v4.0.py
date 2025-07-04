@@ -25,6 +25,16 @@ logger = logging.getLogger(__name__)
 handler = logging.StreamHandler()
 handler.setLevel(logging.INFO)
 
+# Import OpenWebUI classes if available
+try:
+    from webui.models.users import Users  # type: ignore
+    from webui.models.memories import Memories  # type: ignore
+    OPENWEBUI_AVAILABLE = True
+    logger.info("OpenWebUI classes imported successfully")
+except ImportError:
+    OPENWEBUI_AVAILABLE = False
+    logger.info("OpenWebUI classes not available, using mock implementations")
+
 # Import JSON repair system
 try:
     from json_repair_system import EnhancedJSONParser  # type: ignore
@@ -146,8 +156,10 @@ class MockMemories:
         _ = user_id  # Acknowledge parameter
         return []
 
-Users = MockUsers()
-Memories = MockMemories()
+# Use real OpenWebUI classes if available, otherwise use mocks
+if not OPENWEBUI_AVAILABLE:
+    Users = MockUsers()
+    Memories = MockMemories()
 
 # Metrics mock objects with inc() and observe() methods
 class MockMetric:
@@ -1490,7 +1502,7 @@ Analyze the following related memories and provide a concise summary.""",
         self._connection_health = {}
         self._last_health_check = {}
         self._session_connector = None
-        self._background_tasks = set()
+        self._background_tasks: List[asyncio.Task] = []
         self.error_counters = {"embedding_errors": 0, "llm_call_errors": 0, "json_parse_errors": 0, "memory_crud_errors": 0}
 
         if self.internal_config.enable_error_logging_task:
@@ -1761,8 +1773,17 @@ Analyze the following related memories and provide a concise summary.""",
     def _add_background_task(self, coro):
         try:
             task = asyncio.create_task(coro)
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+            # Use list operations instead of set
+            if not hasattr(self, '_background_tasks'):
+                self._background_tasks = []
+            self._background_tasks.append(task)
+            # Clean up completed tasks when done
+            def cleanup_task(t):
+                try:
+                    self._background_tasks.remove(t)
+                except ValueError:
+                    pass
+            task.add_done_callback(cleanup_task)
             return task
         except RuntimeError:
             # No event loop running, skip background task creation
@@ -2104,8 +2125,14 @@ Analyze the following related memories and provide a concise summary.""",
 
         # Start the update loop in the background
         task = asyncio.create_task(update_date_loop())
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        self._background_tasks.append(task)
+        # Clean up completed tasks when done
+        def cleanup_task(t):
+            try:
+                self._background_tasks.remove(t)
+            except ValueError:
+                pass
+        task.add_done_callback(cleanup_task)
         return task
 
     def _schedule_model_discovery(self):
@@ -2133,8 +2160,14 @@ Analyze the following related memories and provide a concise summary.""",
 
         # Start the discovery loop in the background
         task = asyncio.create_task(discover_models_loop())
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        self._background_tasks.append(task)
+        # Clean up completed tasks when done
+        def cleanup_task(t):
+            try:
+                self._background_tasks.remove(t)
+            except ValueError:
+                pass
+        task.add_done_callback(cleanup_task)
         return task
 
     async def _discover_models(self):
@@ -7095,8 +7128,44 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
             try:
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
-                    # Already in async context - cannot use run_until_complete
-                    logger.warning(f"Sync {method_name} called from async context - returning body unchanged")
+                    # Already in async context - create a task to run in background
+                    logger.info(f"Sync {method_name} called from async context - scheduling async execution")
+                    
+                    # Already in async context - we need to handle this differently
+                    # For OpenWebUI, we'll create a background task that won't block
+                    
+                    # Store the coroutine for background execution
+                    if not hasattr(self, '_background_tasks'):
+                        self._background_tasks: List[asyncio.Task] = []
+                    
+                    async def process_in_background():
+                        try:
+                            # Run the coroutine
+                            result = await coro
+                            logger.info(f"{method_name} background processing completed successfully")
+                            # For inlet, we want to extract memories but return original body
+                            # For outlet, we want to inject memories but process happens async
+                            if method_name == "inlet":
+                                # Memory extraction happens in background
+                                return fallback_body
+                            else:
+                                # Memory injection for outlet - return processed result
+                                return result
+                        except Exception as e:
+                            logger.error(f"Background {method_name} processing error: {e}\n{traceback.format_exc()}")
+                            return fallback_body
+                    
+                    # Create and track the background task
+                    task = asyncio.create_task(process_in_background())
+                    self._background_tasks.append(task)
+                    
+                    # Clean up completed tasks periodically
+                    self._background_tasks = [t for t in self._background_tasks if not t.done()]
+                    
+                    # Log that we're processing in background
+                    logger.info(f"{method_name} scheduled for background processing (OpenWebUI async context)")
+                    
+                    # Return the fallback body immediately for OpenWebUI
                     return fallback_body
                 else:
                     # Existing loop not running - safe to use
