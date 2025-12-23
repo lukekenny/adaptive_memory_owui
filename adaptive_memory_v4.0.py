@@ -1621,10 +1621,20 @@ Analyze the following related memories and provide a concise summary.""",
             data = self._load_configuration_safe()
             if not data and not force_reload:
                 return True
+            data = self._merge_sensitive_valves(data)
             self.valves = self.Valves(**data)
             return self._validate_configuration_integrity(self.valves)
         except:
             return False
+    
+    def _hot_reload_configuration(self, reason: str) -> None:
+        try:
+            if not self._reload_configuration_safe(True):
+                log_with_context('warning', "Configuration hot reload failed, using existing settings",
+                               component='CONFIG', operation='hot_reload', context={'reason': reason})
+        except Exception as e:
+            log_with_context('warning', "Configuration hot reload error, using existing settings",
+                           component='CONFIG', operation='hot_reload', context={'reason': reason}, error=e)
     
     def _ensure_configuration_persistence(self):
         if not hasattr(self, 'valves') or not self.valves:
@@ -2805,8 +2815,7 @@ Analyze the following related memories and provide a concise summary.""",
         # --- Initialization & Valve Loading ---
         # Load valves early, handle potential errors
         try:
-            # Reload global valves if OWUI injected config exists; otherwise keep defaults
-            self.valves = self.Valves(**getattr(self, "config", {}).get("valves", {}))
+            self._hot_reload_configuration("inlet")
 
             # Load user-specific valves (may override some per-user settings)
             user_valves = self._get_user_valves(__user__)
@@ -3334,6 +3343,8 @@ Analyze the following related memories and provide a concise summary.""",
         except Exception as e:
             log_with_context('warning', "Configuration persistence check error, continuing with current config",
                            component='OUTLET', user_id=user_id, operation='config_check', error=e)
+        
+        self._hot_reload_configuration("outlet")
 
         # Skip processing if user is not authenticated
         if not __user__:
@@ -6430,6 +6441,7 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
         Returns:
             String response from LLM or error message
         """
+        self._hot_reload_configuration("llm_request")
         # Get configuration from valves
         provider_type = self.valves.llm_provider 
         model = self.valves.llm_model_name
