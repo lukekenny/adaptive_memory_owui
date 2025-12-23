@@ -1110,7 +1110,7 @@ class Filter:
         
         allowed_memory_banks: Optional[List[str]] = Field(
             default=None,
-            description="🗂️ Memory Categories: Organize memories into these categories (optional - leave empty to disable categorization)"
+            description="🗂️ Memory Categories: Organize memories into these categories (optional - leave empty to disable categorization). Enter as comma-separated list."
         )
         
         default_memory_bank: str = Field(
@@ -1361,6 +1361,9 @@ Analyze the following related memories and provide a concise summary.""",
         def validate_memory_banks(cls, v):
             if v is None:
                 return None  # Allow None for no categorization
+            if isinstance(v, str):
+                parsed_banks = [bank.strip() for bank in v.split(",") if bank and bank.strip()]
+                return parsed_banks if parsed_banks else None
             if not isinstance(v, list) or not v:
                 return None  # Return None instead of default list
             valid_banks = [bank.strip() for bank in v if bank and isinstance(bank, str) and bank.strip()]
