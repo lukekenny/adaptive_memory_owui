@@ -1108,7 +1108,7 @@ class Filter:
         # 🏛️ MEMORY ORGANIZATION
         # ================================================================
         
-        allowed_memory_banks: Optional[List[str]] = Field(
+        allowed_memory_banks: Optional[str] = Field(
             default=None,
             description="🗂️ Memory Categories: Organize memories into these categories (optional - leave empty to disable categorization). Enter as comma-separated list."
         )
@@ -1357,17 +1357,23 @@ Analyze the following related memories and provide a concise summary.""",
                  raise ValueError(f"Error validating timezone '{v}': {e}")
             return v
         
-        @field_validator('allowed_memory_banks')
-        def validate_memory_banks(cls, v):
+        @field_validator('allowed_memory_banks', mode="before")
+        def normalize_memory_banks(cls, v):
             if v is None:
                 return None  # Allow None for no categorization
+            if isinstance(v, list):
+                parsed_banks = [bank.strip() for bank in v if bank and isinstance(bank, str) and bank.strip()]
+                return ", ".join(parsed_banks) if parsed_banks else None
             if isinstance(v, str):
                 parsed_banks = [bank.strip() for bank in v.split(",") if bank and bank.strip()]
-                return parsed_banks if parsed_banks else None
-            if not isinstance(v, list) or not v:
-                return None  # Return None instead of default list
-            valid_banks = [bank.strip() for bank in v if bank and isinstance(bank, str) and bank.strip()]
-            return valid_banks if valid_banks else None
+                return ", ".join(parsed_banks) if parsed_banks else None
+            return None
+
+        @property
+        def allowed_memory_banks_list(self) -> List[str]:
+            if not self.allowed_memory_banks:
+                return []
+            return [bank.strip() for bank in self.allowed_memory_banks.split(",") if bank and bank.strip()]
         
         @field_validator('default_memory_bank')
         def validate_default_memory_bank(cls, v):
@@ -1462,9 +1468,10 @@ Analyze the following related memories and provide a concise summary.""",
         
         @model_validator(mode="after")
         def check_memory_bank_consistency(self):
-            if self.allowed_memory_banks and self.default_memory_bank not in self.allowed_memory_banks:
-                object.__setattr__(self, 'default_memory_bank', self.allowed_memory_banks[0])
-            elif not self.allowed_memory_banks:
+            allowed_banks = self.allowed_memory_banks_list
+            if allowed_banks and self.default_memory_bank not in allowed_banks:
+                object.__setattr__(self, 'default_memory_bank', allowed_banks[0])
+            elif not allowed_banks:
                 object.__setattr__(self, 'default_memory_bank', "General")  # Default when no categories
             return self
 
@@ -1483,7 +1490,7 @@ Analyze the following related memories and provide a concise summary.""",
     def _validate_configuration_integrity(self, valves_instance) -> bool:
         try:
             return all([
-                (valves_instance.allowed_memory_banks is None or (isinstance(valves_instance.allowed_memory_banks, list) and valves_instance.allowed_memory_banks)),
+                (valves_instance.allowed_memory_banks is None or (isinstance(valves_instance.allowed_memory_banks, str) and valves_instance.allowed_memory_banks.strip())),
                 isinstance(valves_instance.default_memory_bank, str) and valves_instance.default_memory_bank.strip(),
                 0.0 <= valves_instance.vector_similarity_threshold <= 1.0,
                 0.0 <= valves_instance.relevance_threshold <= 1.0,
@@ -2887,7 +2894,7 @@ Analyze the following related memories and provide a concise summary.""",
                 log_with_context('info', "Handling /memory list_banks command",
                                component='INLET', user_id=user_id, operation='command_list_banks')
                 try:
-                    allowed_banks = self.valves.allowed_memory_banks
+                    allowed_banks = self.valves.allowed_memory_banks_list
                     default_bank = self.valves.default_memory_bank
                     if allowed_banks:
                         bank_list_str = "\n".join([f"- {bank} {'(Default)' if bank == default_bank else ''}" for bank in allowed_banks])
@@ -2923,10 +2930,11 @@ Analyze the following related memories and provide a concise summary.""",
                     memory_id = command_parts[2]
                     target_bank = command_parts[3]
 
-                    if not self.valves.allowed_memory_banks:
+                    allowed_banks = self.valves.allowed_memory_banks_list
+                    if not allowed_banks:
                         await self._safe_emit(__event_emitter__, {"type": "error", "content": "Memory banks are disabled. Cannot assign memories to banks."})
-                    elif target_bank not in self.valves.allowed_memory_banks:
-                        allowed_banks_str = ", ".join(self.valves.allowed_memory_banks)
+                    elif target_bank not in allowed_banks:
+                        allowed_banks_str = ", ".join(allowed_banks)
                         await self._safe_emit(__event_emitter__, {"type": "error", "content": f"Invalid bank '{target_bank}'. Allowed banks: {allowed_banks_str}"})
                     else:
                         # 1. Query the specific memory
@@ -4514,7 +4522,7 @@ Produce ONLY the JSON array output for the user message above, adhering strictly
 
             # --- SIMPLIFIED VALIDATION LOGIC ---
             # Use the validated list directly from self.valves
-            allowed_banks_list = self.valves.allowed_memory_banks or []
+            allowed_banks_list = self.valves.allowed_memory_banks_list
 
             if provided_bank in allowed_banks_list:
                  # Valid bank provided
@@ -6710,7 +6718,8 @@ Current datetime: {current_datetime.strftime('%A, %B %d, %Y %H:%M:%S')} ({curren
                         memory_bank = item.get("memory_bank", self.valves.default_memory_bank)
                         
                         # Validate memory_bank
-                        if self.valves.allowed_memory_banks and memory_bank not in self.valves.allowed_memory_banks:
+                        allowed_banks = self.valves.allowed_memory_banks_list
+                        if allowed_banks and memory_bank not in allowed_banks:
                             memory_bank = self.valves.default_memory_bank
 
                         # Basic validation
