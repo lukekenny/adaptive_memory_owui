@@ -118,8 +118,8 @@ def log_with_context(level: str, message: str, component: str = 'SYSTEM',
 
 # Import OpenWebUI classes if available
 try:
-    from webui.models.users import Users  # type: ignore
-    from webui.models.memories import Memories  # type: ignore
+    from open_webui.models.users import Users  # type: ignore
+    from open_webui.models.memories import Memories  # type: ignore
     OPENWEBUI_AVAILABLE = True
     logger.info("OpenWebUI classes imported successfully")
 except ImportError:
