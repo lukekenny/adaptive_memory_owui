@@ -1498,10 +1498,42 @@ Analyze the following related memories and provide a concise summary.""",
     
     def _persist_configuration_state(self):
         pass
+
+    def _merge_sensitive_valves(self, new_config: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(new_config, dict):
+            return {}
+        merged = dict(new_config)
+        existing_valves = {}
+        if isinstance(getattr(self, "config", None), dict):
+            existing_valves = self.config.get("valves", {}) or {}
+
+        def existing_value_for(key: str) -> Optional[str]:
+            if isinstance(existing_valves, dict) and key in existing_valves:
+                value = existing_valves.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+            current_valves = getattr(self, "valves", None)
+            if current_valves:
+                value = getattr(current_valves, key, None)
+                if isinstance(value, str) and value.strip():
+                    return value
+            return None
+
+        def is_masked(value: Any) -> bool:
+            return isinstance(value, str) and re.fullmatch(r"\*+", value.strip() or "") is not None
+
+        for key in ("llm_api_key", "embedding_api_key"):
+            if key not in merged or is_masked(merged.get(key)):
+                existing_value = existing_value_for(key)
+                if existing_value:
+                    merged[key] = existing_value
+
+        return merged
     
     def _validate_configuration_save(self, new_config: Dict[str, Any]) -> tuple[bool, str]:
         try:
-            test_valves = self.Valves(**new_config)
+            merged_config = self._merge_sensitive_valves(new_config)
+            test_valves = self.Valves(**merged_config)
             if not self._validate_configuration_integrity(test_valves):
                 return False, "Configuration failed integrity validation"
             if hasattr(test_valves, 'llm_api_endpoint_url') and test_valves.llm_api_endpoint_url:
@@ -1525,12 +1557,13 @@ Analyze the following related memories and provide a concise summary.""",
     
     async def _save_configuration_safe(self, new_config: Dict[str, Any]) -> tuple[bool, str]:
         try:
-            is_valid, msg = self._validate_configuration_save(new_config)
+            merged_config = self._merge_sensitive_valves(new_config)
+            is_valid, msg = self._validate_configuration_save(merged_config)
             if not is_valid:
                 return False, msg
             backup = self.valves.model_dump() if hasattr(self.valves, 'model_dump') else None
-            self.valves = self.Valves(**new_config)
-            self.config['valves'] = new_config
+            self.valves = self.Valves(**merged_config)
+            self.config['valves'] = merged_config
             if not self._validate_configuration_integrity(self.valves):
                 if backup:
                     self.valves = self.Valves(**backup)
@@ -1544,11 +1577,12 @@ Analyze the following related memories and provide a concise summary.""",
         try:
             if not self._is_system_ready_for_config_save()[0]:
                 return False
-            if not self._validate_configuration_save(valves_data)[0]:
+            merged_config = self._merge_sensitive_valves(valves_data)
+            if not self._validate_configuration_save(merged_config)[0]:
                 return False
             backup = self.valves.model_dump() if hasattr(self.valves, 'model_dump') else None
-            self.valves = self.Valves(**valves_data)
-            self.config['valves'] = valves_data
+            self.valves = self.Valves(**merged_config)
+            self.config['valves'] = merged_config
             if not self._validate_configuration_integrity(self.valves):
                 if backup:
                     self.valves = self.Valves(**backup)
@@ -1576,7 +1610,8 @@ Analyze the following related memories and provide a concise summary.""",
         try:
             if not self._is_system_ready_for_config_save()[0]:
                 return False, "System not ready"
-            self.Valves(**new_config)
+            merged_config = self._merge_sensitive_valves(new_config)
+            self.Valves(**merged_config)
             return True, "Valid"
         except Exception as e:
             return False, str(e)
